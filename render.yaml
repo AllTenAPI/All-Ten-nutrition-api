@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: all-ten-nutrition-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    plan: free 
