@@ -3,5 +3,5 @@ services:
     name: all-ten-nutrition-api
     env: python
     plan: free
-    buildCommand: pip install -r requirements-simple.txt
+    buildCommand: pip install Flask Flask-CORS gunicorn
     startCommand: gunicorn app-simple:app 
