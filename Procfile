@@ -1,1 +1,1 @@
-web: gunicorn app-simple:app 
+web: python3 app-railway.py 
