@@ -88,6 +88,29 @@ class GoogleVisionNutritionAPI(BaseHTTPRequestHandler):
             }
             self.wfile.write(json.dumps(response).encode())
             
+        elif path == '/debug':
+            # Debug endpoint to see what's happening
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            
+            # Check environment variables
+            env_var = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS_JSON')
+            env_var_length = len(env_var) if env_var else 0
+            env_var_preview = env_var[:100] + "..." if env_var and len(env_var) > 100 else env_var
+            
+            debug_info = {
+                "vision_client_exists": self.vision_client is not None,
+                "google_vision_available": GOOGLE_VISION_AVAILABLE,
+                "env_var_exists": env_var is not None,
+                "env_var_length": env_var_length,
+                "env_var_preview": env_var_preview,
+                "env_var_starts_with_brace": env_var.startswith('{') if env_var else False,
+                "env_var_ends_with_brace": env_var.endswith('}') if env_var else False
+            }
+            
+            self.wfile.write(json.dumps(debug_info, indent=2).encode())
         elif path == '/':
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
