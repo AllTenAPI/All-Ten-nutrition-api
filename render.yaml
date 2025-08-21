@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: all-ten-nutrition-api
+    env: python
+    plan: free
+    buildCommand: poetry install
+    startCommand: poetry run python app-render.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.7 
