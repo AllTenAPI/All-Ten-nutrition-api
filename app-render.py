@@ -12,25 +12,60 @@ from urllib.parse import urlparse
 import time
 import random
 import hashlib
-from google.cloud import vision
-from google.oauth2 import service_account
+import traceback
+
+# Try to import Google Cloud Vision, but don't crash if it fails
+try:
+    from google.cloud import vision
+    from google.oauth2 import service_account
+    GOOGLE_VISION_AVAILABLE = True
+    print("✅ Google Cloud Vision imports successful")
+except ImportError as e:
+    print(f"⚠️ Google Cloud Vision import failed: {e}")
+    GOOGLE_VISION_AVAILABLE = False
 
 class GoogleVisionNutritionAPI(BaseHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
-        # Initialize Google Cloud Vision client
+        self.vision_client = None
         try:
-            # Try to load credentials from file
-            credentials_path = os.path.join(os.path.dirname(__file__), 'google-credentials.json')
-            if os.path.exists(credentials_path):
-                credentials = service_account.Credentials.from_service_account_file(credentials_path)
-                self.vision_client = vision.ImageAnnotatorClient(credentials=credentials)
-                print("✅ Google Cloud Vision client initialized with service account")
+            if GOOGLE_VISION_AVAILABLE:
+                # Try to get credentials from environment variable first
+                credentials_json = os.environ.get('GOOGLE_APPLICATION_CREDENTIALS_JSON')
+                if credentials_json:
+                    try:
+                        # Parse the JSON string from environment
+                        credentials_info = json.loads(credentials_json)
+                        credentials = service_account.Credentials.from_service_account_info(credentials_info)
+                        self.vision_client = vision.ImageAnnotatorClient(credentials=credentials)
+                        print("✅ Google Cloud Vision client initialized with environment credentials")
+                    except json.JSONDecodeError as e:
+                        print(f"❌ Failed to parse credentials JSON: {e}")
+                        print(f"Credentials content preview: {credentials_json[:100]}...")
+                    except Exception as e:
+                        print(f"❌ Failed to create credentials from JSON: {e}")
+                else:
+                    print("⚠️ No GOOGLE_APPLICATION_CREDENTIALS_JSON environment variable found")
+                    # Fallback to file if environment variable not set
+                    credentials_path = os.path.join(os.path.dirname(__file__), 'google-credentials.json')
+                    if os.path.exists(credentials_path):
+                        try:
+                            credentials = service_account.Credentials.from_service_account_file(credentials_path)
+                            self.vision_client = vision.ImageAnnotatorClient(credentials=credentials)
+                            print("✅ Google Cloud Vision client initialized with service account file")
+                        except Exception as e:
+                            print(f"❌ Failed to load credentials from file: {e}")
+                    else:
+                        print("⚠️ No credentials file found, trying default credentials")
+                        try:
+                            self.vision_client = vision.ImageAnnotatorClient()
+                            print("✅ Google Cloud Vision client initialized with default credentials")
+                        except Exception as e:
+                            print(f"❌ Failed to initialize with default credentials: {e}")
             else:
-                # Fallback to environment variable (for Render deployment)
-                self.vision_client = vision.ImageAnnotatorClient()
-                print("✅ Google Cloud Vision client initialized with default credentials")
+                print("⚠️ Google Cloud Vision not available")
         except Exception as e:
             print(f"❌ Failed to initialize Google Cloud Vision: {e}")
+            print(f"Full traceback: {traceback.format_exc()}")
             self.vision_client = None
         
         super().__init__(*args, **kwargs)
