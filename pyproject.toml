@@ -1,18 +1,23 @@
 [tool.poetry]
 name = "all-ten-nutrition-api"
-version = "0.1.0"
-description = "All Ten Nutrition API with Google Cloud Vision integration"
-authors = ["Your Name <your.email@example.com>"]
+version = "2.0.0"
+description = "All Ten Nutrition API: Claude vision portion estimation + USDA FoodData Central"
+authors = ["All Ten <noel.tsu.sithole@gmail.com>"]
 
 [tool.poetry.dependencies]
 python = "3.11.7"
-google-cloud-vision = "^3.4.4"
-Flask = "^3.0.0"
-Flask-CORS = "^4.0.0"
+# The only runtime dependency. USDA FoodData Central is called with stdlib
+# urllib and the server is stdlib http.server, so there is no HTTP client or
+# web framework dependency.
+#
+# Removed in 2.0.0: google-cloud-vision (label detection cannot estimate
+# portion size, which was the actual defect), Flask and Flask-CORS (neither
+# deploy entrypoint ever used Flask).
+anthropic = ">=1.2,<2"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.0.0"
 
 [build-system]
 requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api" 
+build-backend = "poetry.core.masonry.api"

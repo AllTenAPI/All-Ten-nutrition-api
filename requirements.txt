@@ -1,3 +1,10 @@
-google-cloud-vision==3.4.4
-Flask==3.0.0
-Flask-CORS==4.0.0 
+# All Ten Nutrition API runtime dependencies.
+#
+# The Claude vision + USDA pipeline needs exactly one third-party package.
+# USDA FoodData Central is called with stdlib urllib, and the HTTP server is
+# stdlib http.server -- no HTTP client or web framework dependency.
+#
+# Removed: google-cloud-vision (label detection could not estimate portion
+# size, which was the actual defect), Flask and Flask-CORS (neither deploy
+# entrypoint ever used Flask -- both are http.server).
+anthropic>=1.2,<2
