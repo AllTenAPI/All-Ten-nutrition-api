@@ -268,16 +268,21 @@ def _lookup_uncached(barcode: str, timeout: float) -> dict | None:
     try:
         _, payload = _http_get_json(url, timeout)
     except urllib.error.HTTPError as exc:
-        if exc.code == 404:
+        code = exc.code
+        # An HTTPError is a file-like object holding the (unread) response
+        # body. Nothing here reads it, so close it rather than leaving it for
+        # the garbage collector.
+        exc.close()
+        if code == 404:
             # v2 answers an unknown barcode with a 404. That is a clean miss,
             # not an outage.
             return None
-        if exc.code == 429:
+        if code == 429:
             raise OpenFoodFactsUnavailable(
                 "Open Food Facts rate limit reached (HTTP 429)."
             ) from None
         raise OpenFoodFactsUnavailable(
-            f"Open Food Facts returned HTTP {exc.code}."
+            f"Open Food Facts returned HTTP {code}."
         ) from None
     except urllib.error.URLError as exc:
         raise OpenFoodFactsUnavailable(

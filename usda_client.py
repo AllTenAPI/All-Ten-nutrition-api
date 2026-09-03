@@ -368,15 +368,20 @@ def _raw_search(
     try:
         return _http_get_json(f"{SEARCH_URL}?{params}", timeout)
     except urllib.error.HTTPError as exc:
-        if exc.code in (401, 403):
+        code = exc.code
+        # An HTTPError is a file-like object holding the (unread) response
+        # body. Nothing here reads it, so close it rather than leaving it for
+        # the garbage collector.
+        exc.close()
+        if code in (401, 403):
             # Do not include the URL: it carries the key in the query string.
             raise UsdaUnavailable(
-                f"USDA rejected the credentials (HTTP {exc.code}). "
+                f"USDA rejected the credentials (HTTP {code}). "
                 "Check USDA_FDC_API_KEY in the deploy environment."
             ) from None
-        if exc.code == 429:
+        if code == 429:
             raise UsdaUnavailable("USDA rate limit reached (HTTP 429).") from None
-        raise UsdaUnavailable(f"USDA returned HTTP {exc.code}.") from None
+        raise UsdaUnavailable(f"USDA returned HTTP {code}.") from None
     except urllib.error.URLError as exc:
         raise UsdaUnavailable(f"Could not reach USDA FoodData Central: {exc.reason}") from None
     except (TimeoutError, OSError) as exc:
