@@ -10,7 +10,10 @@ Routes
 ``GET  /``              service banner
 ``GET  /health``        liveness + configuration status
 ``GET  /debug``         diagnostics (presence of env vars only, never values)
-``POST /analyze_food``  the analysis endpoint -- see API_CONTRACT.md
+``POST /analyze_food``  photo analysis -- Claude vision + USDA. Costs LLM tokens.
+``POST /search_food``   free-text food search -- USDA only. No LLM call.
+``POST /barcode``       UPC/EAN lookup -- USDA Branded, then Open Food Facts.
+                        No LLM call.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+import food_lookup
 import nutrition_analyzer
 
 # A base64-encoded 5 MB image is ~6.7 MB; leave headroom for the JSON envelope.
@@ -97,7 +101,14 @@ class NutritionRequestHandler(BaseHTTPRequestHandler):
                     "platform": self.platform,
                     "analysis": "Claude vision portion estimation + USDA FoodData Central",
                     "analysis_version": nutrition_analyzer.ANALYSIS_VERSION,
-                    "endpoints": ["/", "/health", "/debug", "/analyze_food"],
+                    "endpoints": [
+                        "/",
+                        "/health",
+                        "/debug",
+                        "/analyze_food",
+                        "/search_food",
+                        "/barcode",
+                    ],
                 }
             )
         else:
@@ -106,7 +117,13 @@ class NutritionRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
 
-        if path != "/analyze_food":
+        if path == "/analyze_food":
+            handler = self._handle_analyze_food
+        elif path == "/search_food":
+            handler = self._handle_search_food
+        elif path == "/barcode":
+            handler = self._handle_barcode
+        else:
             self._send_json({"error": "Not found", "path": path}, status=404)
             return
 
@@ -123,6 +140,11 @@ class NutritionRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        handler(data)
+
+    # -- POST handlers -----------------------------------------------------
+
+    def _handle_analyze_food(self, data: dict) -> None:
         image_data = data.get("image") or data.get("image_base64") or ""
         media_type = data.get("media_type") or data.get("mime_type")
 
@@ -146,6 +168,16 @@ class NutritionRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        self._send_json(payload, status=status)
+
+    def _handle_search_food(self, data: dict) -> None:
+        """Free-text food search. Makes no Anthropic call on any path."""
+        payload, status = food_lookup.search_food(data)
+        self._send_json(payload, status=status)
+
+    def _handle_barcode(self, data: dict) -> None:
+        """UPC/EAN lookup. Makes no Anthropic call on any path."""
+        payload, status = food_lookup.barcode_lookup(data)
         self._send_json(payload, status=status)
 
     def do_OPTIONS(self):

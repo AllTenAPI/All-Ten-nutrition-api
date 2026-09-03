@@ -605,7 +605,10 @@ def lookup_barcode(barcode: str, timeout: float | None = None) -> dict | None:
     if not digits:
         return None
 
-    key = f"barcode:{digits}"
+    # Key on the leading-zero-stripped form: a 12-digit UPC and its 13-digit
+    # EAN spelling are the same product, so the second scan of either must be
+    # a cache hit rather than a second network call.
+    key = f"barcode:{_gtin_key(digits) or digits}"
     hit, value = _cache_get(key)
     if hit:
         return value

@@ -28,6 +28,7 @@ import os
 import time
 
 import claude_vision
+import openfoodfacts_client
 import usda_client
 from claude_vision import VisionError, VisionRefusal
 from usda_client import UsdaUnavailable
@@ -500,6 +501,10 @@ def debug_payload() -> dict:
             "max_food_portion_grams": max_food_portion_grams(),
         },
         "usda_cache": usda_client.cache_stats(),
+        # Open Food Facts needs no credential, so there is nothing to report
+        # about its configuration -- only whether repeat barcode scans are
+        # being served from cache rather than re-hitting the network.
+        "openfoodfacts_cache": openfoodfacts_client.cache_stats(),
         "supported_media_types": list(claude_vision.SUPPORTED_MEDIA_TYPES),
         "timestamp": time.time(),
     }
