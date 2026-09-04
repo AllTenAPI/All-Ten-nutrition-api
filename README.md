@@ -32,17 +32,35 @@ serotonin and melatonin, all produced by `random.uniform()` — are gone.
    `needs_confirmation: true` with a reason, so the client asks the user
    instead of silently logging a wrong number.
 
+That pipeline is `POST /analyze_food`, and it is the only endpoint that costs
+LLM tokens. Two lookup endpoints handle the cases that never needed a model:
+
+- **`POST /search_food`** — free-text search against USDA. Branded data is
+  searchable but ranked below Foundation / SR Legacy / FNDDS, so "grilled
+  chicken" still resolves to lab-measured data while "quest protein bar"
+  becomes findable.
+- **`POST /barcode`** — UPC/EAN. USDA Branded first, then Open Food Facts
+  (free, no key, far better coverage outside the US). An unknown barcode
+  returns a clean not-found; macros are never invented for it.
+
+Neither makes an Anthropic call. See `API_CONTRACT.md`.
+
 ## Layout
 
 | File | Role |
 |---|---|
 | `nutrition_analyzer.py` | Orchestration, scaling, aggregation, clamps, response shaping |
 | `claude_vision.py` | Claude vision step, image validation, error taxonomy |
-| `usda_client.py` | USDA FoodData Central lookup + cache |
+| `usda_client.py` | USDA FoodData Central lookup, ranking, search, barcode + cache |
+| `openfoodfacts_client.py` | Open Food Facts barcode fallback + cache |
+| `food_lookup.py` | `/search_food` and `/barcode` — no LLM call on any path |
 | `http_app.py` | Shared routes and server, used by both entrypoints |
 | `app-render.py` | Render entrypoint (`poetry run python app-render.py`) |
 | `app-railway.py` | Railway entrypoint (`python app-railway.py`) |
-| `test_nutrition_analyzer.py` | Tests (stdlib `unittest`) |
+| `test_nutrition_analyzer.py` | Analyzer pipeline tests (stdlib `unittest`) |
+| `test_usda_ranking.py` | Data-type ranking, search paging, USDA barcode matching |
+| `test_food_lookup.py` | `/search_food` and `/barcode` behaviour |
+| `test_openfoodfacts_client.py` | Open Food Facts parsing and unit conversions |
 
 `app.py`, `app-simple.py`, `app-minimal.py` and `app-render.py.backup` are dead
 code kept only for reference. Nothing deploys them; do not build on them.
@@ -81,9 +99,19 @@ python app-render.py          # http://localhost:10000
 curl localhost:10000/health
 curl localhost:10000/debug
 
+# costs LLM tokens
 curl -X POST localhost:10000/analyze_food \
   -H 'Content-Type: application/json' \
   -d "{\"image\": \"$(base64 -i meal.jpg | tr -d '\n')\"}"
+
+# no LLM tokens
+curl -X POST localhost:10000/search_food \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "quest protein bar", "limit": 10}'
+
+curl -X POST localhost:10000/barcode \
+  -H 'Content-Type: application/json' \
+  -d '{"barcode": "0888849000371"}'
 ```
 
 ## Tests
@@ -91,15 +119,18 @@ curl -X POST localhost:10000/analyze_food \
 No pytest in the deploy image, so the suite is stdlib `unittest`:
 
 ```bash
-python3 -m unittest test_nutrition_analyzer -v
+python3 -m unittest discover -p 'test_*.py'
 ```
 
-63 tests, no network calls and no credentials required. They cover portion
+197 tests, no network calls and no credentials required. They cover portion
 scaling, macro aggregation, clamp logic, response shaping, USDA parsing and
-outage degradation, image validation, and that `/debug` leaks nothing.
+outage degradation, image validation, that `/debug` leaks nothing, USDA
+data-type ranking with Branded last, `/search_food` and `/barcode` including
+their not-found paths, barcode cache hits, Open Food Facts unit conversions,
+and that an unmeasured nutrient is `null` rather than `0` everywhere.
 
 ## Dependencies
 
-`anthropic` is the only runtime dependency. USDA is called with stdlib
-`urllib` and the server is stdlib `http.server`, so there is no HTTP client
-and no web framework.
+`anthropic` is the only runtime dependency. USDA and Open Food Facts are both
+called with stdlib `urllib` and the server is stdlib `http.server`, so there
+is no HTTP client and no web framework. Open Food Facts needs no credential.

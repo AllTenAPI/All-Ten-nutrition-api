@@ -9,6 +9,8 @@ Nothing here makes a network call or needs a credential.
 from __future__ import annotations
 
 import base64
+import threading
+import time
 import unittest
 
 import claude_vision
@@ -341,19 +343,34 @@ class UsdaEnrichmentTests(unittest.TestCase):
         self.assertEqual(foods[0]["source"], "estimated")
 
     def test_outage_stops_further_lookups_for_the_same_meal(self):
+        """A down service is not called once per food.
+
+        Lookups run concurrently now, so "stops after the first failure" is
+        bounded by how many were already in flight when that failure landed --
+        never by how long the meal is. Twelve foods against a dead service must
+        still cost at most one pool's worth of calls.
+        """
         calls = []
+        calls_lock = threading.Lock()
 
         def down(query):
-            calls.append(query)
+            with calls_lock:
+                calls.append(query)
+            time.sleep(0.01)  # a real outage is not instantaneous
             raise usda_client.UsdaUnavailable("down")
 
-        na.enrich_with_usda(
-            [{"name": "rice", "estimated_portion_grams": 100, "confidence": 0.8},
-             {"name": "beans", "estimated_portion_grams": 100, "confidence": 0.8},
-             {"name": "plantain", "estimated_portion_grams": 100, "confidence": 0.8}],
-            lookup=down,
-        )
-        self.assertEqual(len(calls), 1)
+        meal = [
+            {"name": f"food {i}", "estimated_portion_grams": 100, "confidence": 0.8}
+            for i in range(12)
+        ]
+        foods, available, warnings = na.enrich_with_usda(meal, lookup=down)
+
+        self.assertLessEqual(len(calls), na.USDA_LOOKUP_WORKERS)
+        # The outcome is what the serial version produced: one warning for the
+        # first failure, everything estimated, USDA reported unavailable.
+        self.assertFalse(available)
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual([f["source"] for f in foods], ["estimated"] * 12)
 
     def test_nameless_and_malformed_entries_are_dropped(self):
         foods, _, _ = na.enrich_with_usda(
@@ -376,6 +393,246 @@ class UsdaEnrichmentTests(unittest.TestCase):
         )
         self.assertEqual(seen, ["poulet roti", "chicken"])
         self.assertEqual(foods[0]["source"], "usda")
+
+
+def _serial_enrich(detected_foods, lookup):
+    """The pre-parallel implementation, kept as an executable reference.
+
+    The parallel version must produce a byte-identical ``(foods, available,
+    warnings)`` for any scenario, so the tests below compare against this
+    rather than against hand-written expectations that could drift.
+    """
+    foods, warnings, usda_available = [], [], True
+
+    for raw in detected_foods:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            continue
+
+        grams, was_clamped = na.clamp_portion(raw.get("estimated_portion_grams"))
+        query = str(raw.get("usda_query") or name).strip() or name
+
+        record = None
+        if usda_available:
+            try:
+                record = lookup(query)
+                if record is None and query.lower() != name.lower():
+                    record = lookup(name)
+            except usda_client.UsdaUnavailable as exc:
+                usda_available = False
+                warnings.append(f"USDA lookup unavailable: {exc}")
+                record = None
+            except Exception as exc:
+                usda_available = False
+                warnings.append(f"USDA lookup error: {exc}")
+                record = None
+
+        if record and record.get("per_100g"):
+            macros = na.scale_macros(record["per_100g"], grams)
+            micros = na.scale_micronutrients(
+                record.get("micronutrients_per_100g"), grams
+            )
+            source, description = "usda", record.get("description")
+            fdc_id = record.get("fdc_id")
+        else:
+            estimate = {
+                "calories": raw.get("estimated_calories_per_100g"),
+                "protein": raw.get("estimated_protein_per_100g"),
+                "carbs": raw.get("estimated_carbs_per_100g"),
+                "fat": raw.get("estimated_fat_per_100g"),
+                "fiber": None,
+                "sugar": None,
+                "sodium": None,
+            }
+            macros = na.scale_macros(estimate, grams)
+            micros, source, description, fdc_id = {}, "estimated", None, None
+
+        foods.append(
+            {
+                "name": name,
+                "portion_grams": grams,
+                "portion_clamped": was_clamped,
+                "confidence": na.clamp_confidence(raw.get("confidence")),
+                "macros": macros,
+                "micronutrients": micros,
+                "source": source,
+                "usda_description": description,
+                "fdc_id": fdc_id,
+            }
+        )
+
+    return foods, usda_available, warnings
+
+
+class ParallelLookupTests(unittest.TestCase):
+    """Concurrency must be invisible in the response.
+
+    ``/analyze_food`` is a latency change and nothing else: same ordering, same
+    warnings, same estimated-vs-usda decision per food, same nulls.
+    """
+
+    @staticmethod
+    def _meal(names):
+        return [
+            {
+                "name": name,
+                "estimated_portion_grams": 100,
+                "confidence": 0.9,
+                "estimated_calories_per_100g": 111,
+            }
+            for name in names
+        ]
+
+    def test_results_follow_meal_order_not_completion_order(self):
+        """The slowest lookup is the first food, so completion order is the
+        exact reverse of meal order."""
+        names = ["a", "b", "c", "d", "e", "f"]
+        delays = {name: (len(names) - i) * 0.02 for i, name in enumerate(names)}
+
+        def slow(query):
+            time.sleep(delays[query])
+            return {
+                "per_100g": dict(CHICKEN_PER_100G),
+                "description": f"usda {query}",
+                "fdc_id": ord(query),
+            }
+
+        foods, available, warnings = na.enrich_with_usda(
+            self._meal(names), lookup=slow
+        )
+
+        self.assertTrue(available)
+        self.assertEqual(warnings, [])
+        self.assertEqual([f["name"] for f in foods], names)
+        # Each food carries *its own* record, not a neighbour's.
+        self.assertEqual([f["usda_description"] for f in foods],
+                         [f"usda {name}" for name in names])
+        self.assertEqual([f["fdc_id"] for f in foods], [ord(n) for n in names])
+
+    def test_matches_the_serial_implementation_across_scenarios(self):
+        chicken = {"per_100g": dict(CHICKEN_PER_100G), "description": "chicken",
+                   "fdc_id": 1, "micronutrients_per_100g": {"iron": 1.0}}
+
+        scenarios = {
+            "all hit": lambda q: chicken,
+            "all miss": lambda q: None,
+            "alternating": lambda q: chicken if q in ("a", "c", "e") else None,
+            "fails on the third": _failing_on("c", usda_client.UsdaUnavailable("503")),
+            "fails on the first": _failing_on("a", usda_client.UsdaUnavailable("503")),
+            "fails on the last": _failing_on("f", usda_client.UsdaUnavailable("503")),
+            "unexpected error": _failing_on("d", RuntimeError("kaboom")),
+        }
+        meal = self._meal(["a", "b", "c", "d", "e", "f"])
+
+        for label, lookup in scenarios.items():
+            with self.subTest(scenario=label):
+                self.assertEqual(
+                    na.enrich_with_usda(meal, lookup=lookup),
+                    _serial_enrich(meal, lookup),
+                )
+
+    def test_a_lookup_that_wins_the_race_after_a_failure_is_still_estimated(self):
+        """Serially, a food after the first failure is never looked up. Its
+        concurrent result must therefore be discarded, not used -- otherwise
+        the same meal would report different sources run to run."""
+        def lookup(query):
+            if query == "b":
+                time.sleep(0.02)  # let c and d finish first
+                raise usda_client.UsdaUnavailable("503")
+            return {"per_100g": dict(CHICKEN_PER_100G), "description": query}
+
+        foods, available, warnings = na.enrich_with_usda(
+            self._meal(["a", "b", "c", "d"]), lookup=lookup
+        )
+
+        self.assertFalse(available)
+        self.assertEqual(len(warnings), 1)
+        self.assertEqual([f["source"] for f in foods],
+                         ["usda", "estimated", "estimated", "estimated"])
+
+    def test_estimated_foods_carry_null_micronutrients_never_zero(self):
+        def down(query):
+            raise usda_client.UsdaUnavailable("503")
+
+        foods, _, _ = na.enrich_with_usda(self._meal(["a", "b", "c"]), lookup=down)
+
+        for food in foods:
+            self.assertEqual(food["micronutrients"], {})
+            for field in ("fiber", "sugar", "sodium"):
+                self.assertIsNone(food["macros"][field])
+            # ...and the estimate that *is* known is still reported.
+            self.assertEqual(food["macros"]["calories"], 111)
+
+    def test_concurrency_is_bounded_by_the_worker_ceiling(self):
+        live = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def slow(query):
+            nonlocal live, peak
+            with lock:
+                live += 1
+                peak = max(peak, live)
+            time.sleep(0.02)
+            with lock:
+                live -= 1
+            return {"per_100g": dict(CHICKEN_PER_100G)}
+
+        names = [f"food {i}" for i in range(20)]
+        na.enrich_with_usda(self._meal(names), lookup=slow)
+
+        self.assertLessEqual(peak, na.USDA_LOOKUP_WORKERS)
+        self.assertGreater(peak, 1, "the lookups did not actually run in parallel")
+
+    def test_the_worker_ceiling_is_a_sane_bound(self):
+        self.assertGreaterEqual(na.USDA_LOOKUP_WORKERS, 2)
+        self.assertLessEqual(na.USDA_LOOKUP_WORKERS, 6)
+
+    def test_a_single_food_needs_no_pool(self):
+        threads_before = threading.active_count()
+        foods, available, _ = na.enrich_with_usda(
+            self._meal(["a"]), lookup=lambda q: {"per_100g": dict(CHICKEN_PER_100G)}
+        )
+        self.assertEqual(threading.active_count(), threads_before)
+        self.assertTrue(available)
+        self.assertEqual(foods[0]["source"], "usda")
+
+    def test_the_display_name_fallback_still_runs_inside_one_worker(self):
+        seen = []
+        lock = threading.Lock()
+
+        def lookup(query):
+            with lock:
+                seen.append(query)
+            return {"per_100g": dict(CHICKEN_PER_100G)} if query == "chicken" else None
+
+        foods, _, _ = na.enrich_with_usda(
+            [
+                {"name": "chicken", "usda_query": "poulet roti",
+                 "estimated_portion_grams": 100, "confidence": 0.8},
+                {"name": "rice", "usda_query": "riz",
+                 "estimated_portion_grams": 100, "confidence": 0.8},
+            ],
+            lookup=lookup,
+        )
+
+        self.assertEqual(sorted(seen), ["chicken", "poulet roti", "rice", "riz"])
+        self.assertEqual([f["source"] for f in foods], ["usda", "estimated"])
+
+
+def _failing_on(target, error):
+    """A lookup that answers everything except ``target``, which raises."""
+    chicken = {"per_100g": dict(CHICKEN_PER_100G), "description": "chicken",
+               "fdc_id": 1, "micronutrients_per_100g": {"iron": 1.0}}
+
+    def lookup(query):
+        if query == target:
+            raise error
+        return chicken
+
+    return lookup
 
 
 class PortionDefectRegressionTests(unittest.TestCase):
