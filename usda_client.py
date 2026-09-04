@@ -404,6 +404,30 @@ def _http_get_json(url: str, timeout: float) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def _http_post_json(url: str, body: dict, timeout: float) -> dict:
+    """POST a JSON body and decode the JSON response.
+
+    Search uses POST rather than a query string because one of the data type
+    names -- ``Survey (FNDDS)`` -- contains parentheses. Sent in a URL those
+    are rejected by USDA's edge proxy with a bare nginx HTTP 400, whether they
+    are percent-encoded or literal, and whether the values are comma-joined or
+    repeated. The JSON body sidesteps URL encoding entirely and USDA accepts
+    all three data types together.
+    """
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "all-ten-nutrition-api",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 def _raw_search(
     query: str,
     timeout: float,
@@ -424,18 +448,18 @@ def _raw_search(
             "the server will not guess nutrition data without it."
         )
 
-    params = urllib.parse.urlencode(
-        {
-            "query": query,
-            "api_key": api_key,
-            "pageSize": page_size,
-            "pageNumber": page_number,
-            "dataType": ",".join(data_types),
-            "requireAllWords": "false",
-        }
-    )
+    # The key stays in the query string (USDA authenticates that way); the
+    # search criteria go in the body so ``Survey (FNDDS)`` survives transit.
+    url = f"{SEARCH_URL}?{urllib.parse.urlencode({'api_key': api_key})}"
+    body = {
+        "query": query,
+        "pageSize": page_size,
+        "pageNumber": page_number,
+        "dataType": list(data_types),
+        "requireAllWords": False,
+    }
     try:
-        return _http_get_json(f"{SEARCH_URL}?{params}", timeout)
+        return _http_post_json(url, body, timeout)
     except urllib.error.HTTPError as exc:
         code = exc.code
         # An HTTPError is a file-like object holding the (unread) response
