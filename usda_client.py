@@ -131,10 +131,33 @@ class UsdaUnavailable(Exception):
 # One cache serves name lookups, free-text searches and barcode lookups. Keys
 # are namespaced by prefix so the three never collide, and ``cache_stats()``
 # keeps reporting a single set of counters to ``/debug``.
+#
+# The cache is read and written from several threads at once: ``/analyze_food``
+# looks its foods up in parallel, and both deploy entrypoints run a threading
+# HTTP server. Every mutation of ``_cache`` and ``_cache_stats`` therefore
+# happens under ``_cache_lock``, and ``_inflight`` collapses concurrent callers
+# asking for the *same* key onto a single upstream call (see
+# :func:`_cached_call`).
 
 _cache: dict[str, object] = {}
 _cache_lock = threading.Lock()
 _cache_stats = {"hits": 0, "misses": 0}
+_inflight: dict[str, "_InFlight"] = {}
+
+
+class _InFlight:
+    """One upstream call that other threads may be waiting to share.
+
+    ``value`` or ``error`` is assigned *before* ``event`` is set, so a waiter
+    that observes the event always observes a completed outcome.
+    """
+
+    __slots__ = ("event", "value", "error")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.value = None
+        self.error: BaseException | None = None
 
 
 def normalize_food_name(name: str) -> str:
@@ -172,27 +195,72 @@ def cache_stats() -> dict:
 
 
 def clear_cache() -> None:
-    """Drop every cached lookup. Used by tests and by /debug maintenance."""
+    """Drop every cached lookup. Used by tests and by /debug maintenance.
+
+    In-flight calls are deliberately left alone: their owning thread still
+    holds a reference and will publish its own result. Clearing simply means
+    the next caller starts from an empty cache.
+    """
     with _cache_lock:
         _cache.clear()
         _cache_stats["hits"] = 0
         _cache_stats["misses"] = 0
 
 
-def _cache_get(key: str):
-    """Return ``(hit, value)``. ``hit`` distinguishes a cached ``None`` (a
-    known "no match") from an absent entry."""
+def _cached_call(key: str, producer):
+    """Return the value for ``key``, running ``producer`` at most once.
+
+    A cached ``None`` is a real answer ("USDA has no match for this") and is
+    returned as such -- membership, not truthiness, decides a hit.
+
+    Single-flight: when several threads ask for the same key at the same
+    moment, the first claims it and the rest block until it publishes, then
+    share its result (or re-raise its exception). Without this, a meal
+    containing "rice" twice would make two identical HTTP calls, and a burst of
+    identical requests would multiply upstream load by the number of threads.
+
+    Counter semantics are unchanged for the single-threaded case: ``misses``
+    counts upstream calls that produced a value, ``hits`` counts callers served
+    without one -- which now includes threads that piggybacked on someone
+    else's call.
+    """
     with _cache_lock:
         if key in _cache:
             _cache_stats["hits"] += 1
-            return True, _cache[key]
-    return False, None
+            return _cache[key]
+        pending = _inflight.get(key)
+        owner = pending is None
+        if owner:
+            pending = _InFlight()
+            _inflight[key] = pending
 
+    if not owner:
+        pending.event.wait()
+        with _cache_lock:
+            _cache_stats["hits"] += 1
+        if pending.error is not None:
+            raise pending.error
+        return pending.value
 
-def _cache_put(key: str, value) -> None:
+    try:
+        value = producer()
+    except BaseException as exc:
+        # Failures are not cached -- an outage must not poison the key for the
+        # life of the process. Waiters share this failure; the next caller
+        # after them starts a fresh attempt.
+        pending.error = exc
+        with _cache_lock:
+            _inflight.pop(key, None)
+        pending.event.set()
+        raise
+
+    pending.value = value
     with _cache_lock:
         _cache[key] = value
         _cache_stats["misses"] += 1
+        _inflight.pop(key, None)
+    pending.event.set()
+    return value
 
 
 def is_configured() -> bool:
@@ -417,20 +485,16 @@ def lookup(food_name: str, timeout: float | None = None) -> dict | None:
 
     Results (including "no match") are cached in-process by normalized name so
     a meal with repeated foods, or repeated meals across requests, costs one
-    call each.
+    call each -- including when those repeats are looked up concurrently.
     """
     name = normalize_food_name(food_name)
     if not name:
         return None
 
-    key = f"name:{name}"
-    hit, value = _cache_get(key)
-    if hit:
-        return value
-
-    result = _search_uncached(name, timeout or DEFAULT_TIMEOUT_SECONDS)
-    _cache_put(key, result)
-    return result
+    return _cached_call(
+        f"name:{name}",
+        lambda: _search_uncached(name, timeout or DEFAULT_TIMEOUT_SECONDS),
+    )
 
 
 # --- free-text search -------------------------------------------------------
@@ -566,16 +630,12 @@ def search_foods(
         return {"records": [], "total_hits": 0, "has_more": False}
 
     page, limit = clamp_search_paging(page, limit)
-    key = f"search:{page}:{limit}:{normalized}"
-    hit, value = _cache_get(key)
-    if hit:
-        return value
-
-    result = _search_foods_uncached(
-        normalized, page, limit, timeout or DEFAULT_TIMEOUT_SECONDS
+    return _cached_call(
+        f"search:{page}:{limit}:{normalized}",
+        lambda: _search_foods_uncached(
+            normalized, page, limit, timeout or DEFAULT_TIMEOUT_SECONDS
+        ),
     )
-    _cache_put(key, result)
-    return result
 
 
 # --- barcode ----------------------------------------------------------------
@@ -613,11 +673,7 @@ def lookup_barcode(barcode: str, timeout: float | None = None) -> dict | None:
     # Key on the leading-zero-stripped form: a 12-digit UPC and its 13-digit
     # EAN spelling are the same product, so the second scan of either must be
     # a cache hit rather than a second network call.
-    key = f"barcode:{_gtin_key(digits) or digits}"
-    hit, value = _cache_get(key)
-    if hit:
-        return value
-
-    result = _barcode_uncached(digits, timeout or DEFAULT_TIMEOUT_SECONDS)
-    _cache_put(key, result)
-    return result
+    return _cached_call(
+        f"barcode:{_gtin_key(digits) or digits}",
+        lambda: _barcode_uncached(digits, timeout or DEFAULT_TIMEOUT_SECONDS),
+    )
