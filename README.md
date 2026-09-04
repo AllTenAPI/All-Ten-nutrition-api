@@ -32,8 +32,19 @@ serotonin and melatonin, all produced by `random.uniform()` — are gone.
    `needs_confirmation: true` with a reason, so the client asks the user
    instead of silently logging a wrong number.
 
-That pipeline is `POST /analyze_food`, and it is the only endpoint that costs
-LLM tokens. Two lookup endpoints handle the cases that never needed a model:
+That pipeline is `POST /analyze_food` with the default `mode: "meal"`, and
+that endpoint is the only one that costs LLM tokens.
+
+`POST /analyze_food` with `mode: "nutrition_label"` runs a different job on
+the same endpoint. Photographing the back of a box is a **reading** problem,
+not a recognition one: there is no portion to estimate, and matching the name
+to USDA returns a *generic* product whose macros are not this product's. Label
+mode transcribes the printed panel per serving, converts it to the per-100 g
+basis using the panel's own serving weight, and refuses rather than guesses
+when the panel is unreadable or gives no weight in grams. It makes no USDA
+call.
+
+Two lookup endpoints handle the cases that never needed a model:
 
 - **`POST /search_food`** — free-text search against USDA. Branded data is
   searchable but ranked below Foundation / SR Legacy / FNDDS, so "grilled
@@ -58,6 +69,7 @@ Neither makes an Anthropic call. See `API_CONTRACT.md`.
 | `app-render.py` | Render entrypoint (`poetry run python app-render.py`) |
 | `app-railway.py` | Railway entrypoint (`python app-railway.py`) |
 | `test_nutrition_analyzer.py` | Analyzer pipeline tests (stdlib `unittest`) |
+| `test_nutrition_label.py` | Label mode, and the proof meal mode did not move |
 | `test_usda_ranking.py` | Data-type ranking, search paging, USDA barcode matching |
 | `test_food_lookup.py` | `/search_food` and `/barcode` behaviour |
 | `test_openfoodfacts_client.py` | Open Food Facts parsing and unit conversions |
@@ -104,6 +116,11 @@ curl -X POST localhost:10000/analyze_food \
   -H 'Content-Type: application/json' \
   -d "{\"image\": \"$(base64 -i meal.jpg | tr -d '\n')\"}"
 
+# also costs LLM tokens — reads the printed panel instead of estimating
+curl -X POST localhost:10000/analyze_food \
+  -H 'Content-Type: application/json' \
+  -d "{\"mode\": \"nutrition_label\", \"image\": \"$(base64 -i label.jpg | tr -d '\n')\"}"
+
 # no LLM tokens
 curl -X POST localhost:10000/search_food \
   -H 'Content-Type: application/json' \
@@ -122,12 +139,18 @@ No pytest in the deploy image, so the suite is stdlib `unittest`:
 python3 -m unittest discover -p 'test_*.py'
 ```
 
-197 tests, no network calls and no credentials required. They cover portion
+270 tests, no network calls and no credentials required. They cover portion
 scaling, macro aggregation, clamp logic, response shaping, USDA parsing and
 outage degradation, image validation, that `/debug` leaks nothing, USDA
 data-type ranking with Branded last, `/search_food` and `/barcode` including
 their not-found paths, barcode cache hits, Open Food Facts unit conversions,
-and that an unmeasured nutrient is `null` rather than `0` everywhere.
+label mode's per-serving to per-100 g conversion and its refusal to guess a
+serving weight, and that an unmeasured nutrient is `null` rather than `0`
+everywhere.
+
+One of them, `test_meal_output_is_byte_identical`, pins the exact JSON a meal
+scan produces. Meal mode is the path every scan the app has ever made went
+through, so a change there is a silent change to numbers users already logged.
 
 ## Dependencies
 

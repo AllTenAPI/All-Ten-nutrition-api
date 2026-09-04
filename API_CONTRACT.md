@@ -10,9 +10,14 @@ implementation.
 
 | Endpoint | Input | LLM tokens | Use when |
 |---|---|---|---|
-| `POST /analyze_food` | a meal photo | **yes** — one Claude vision call | Only a model can do this: look at a plate and estimate how much is on it. |
+| `POST /analyze_food` (`mode: "meal"`) | a meal photo | **yes** — one Claude vision call | Only a model can do this: look at a plate and estimate how much is on it. |
+| `POST /analyze_food` (`mode: "nutrition_label"`) | a photo of a nutrition facts panel | **yes** — one Claude vision call | The numbers are printed on the package and the product is too specific for a database to match. |
 | `POST /search_food` | a text query | **no** | The user knows what they ate and can type it. |
 | `POST /barcode` | a UPC/EAN | **no** | The user is holding the package. |
+
+Prefer `/barcode` over label mode when the package has a scannable barcode:
+it costs no tokens and identifies the product exactly. Label mode is for the
+case where the barcode is absent, unreadable, or unknown to both databases.
 
 **`/search_food` and `/barcode` cost no LLM tokens. That is their purpose.**
 They are database lookups, and they should be the default path in the client —
@@ -32,7 +37,8 @@ food parser and one editor.
 ```json
 {
   "image": "<base64 image, or a data: URL>",
-  "media_type": "image/jpeg"
+  "media_type": "image/jpeg",
+  "mode": "meal"
 }
 ```
 
@@ -40,9 +46,12 @@ food parser and one editor.
 |---|---|---|
 | `image` | yes | Bare base64 or `data:image/jpeg;base64,…`. Whitespace and newlines are stripped server-side. Also accepted under the legacy key `image_base64`. |
 | `media_type` | no | Advisory only. The server sniffs the real type from magic bytes and that wins. Also accepted as `mime_type`. |
+| `mode` | no | `"meal"` (default) or `"nutrition_label"`. Case-insensitive. Absent, `null` or blank means `"meal"`. Any other value is a `400 bad_request` — a caller that asked for a label read is never silently given a meal estimate. |
 
 Supported formats: `image/jpeg`, `image/png`, `image/gif`, `image/webp`.
-Maximum decoded image size: 5 MB. Maximum request body: 8 MB.
+Maximum decoded image size: 5 MB. Maximum request body: 8 MB. All of this is
+identical in both modes — the mode is a flag on this endpoint, not a second
+endpoint, so a client can ship the flag before the server honours it.
 
 ### Response
 
@@ -106,7 +115,7 @@ round trip.
 | `confidence` | number | 0–1, for this food and its portion. |
 | `macros` | object | See below. Any field may be `null`. |
 | `micronutrients` | object | May be `{}`. Only populated for `source: "usda"`. |
-| `source` | `"usda"` \| `"estimated"` \| `"openfoodfacts"` | Where the macros came from. `/analyze_food` only ever emits the first two; `"openfoodfacts"` comes from `/barcode`. |
+| `source` | `"usda"` \| `"estimated"` \| `"openfoodfacts"` \| `"nutrition_label"` | Where the macros came from. `/analyze_food` in meal mode emits the first two; `"openfoodfacts"` comes from `/barcode`; `"nutrition_label"` comes from `/analyze_food` in label mode and means the numbers were read off the package. |
 | `usda_description` | string \| null | The matched USDA record, so the user can see what was looked up. `null` when `source` is not `"usda"`. |
 | `fdc_id` | integer \| null | USDA FoodData Central id. `null` when estimated, and `null` for an Open Food Facts result — that database has no FDC id and one is not invented. |
 
@@ -182,6 +191,136 @@ Multiple reasons are joined with `; `.
 | `notes` | string | Short free-text note from the model about anything ambiguous. May be `""`. |
 | `warnings` | string[] | Operational warnings (e.g. a USDA outage message). Not user-facing copy. |
 | `analyzed_at` | number | Unix timestamp. |
+| `mode` | string | Present only when the request sent a `mode`. Always present on a label-mode response, including its failures. A request that sends no `mode` gets a response with no `mode` key — byte-identical to what this endpoint returned before label mode existed. |
+| `label` | object | Label mode only. See below. |
+
+---
+
+### Label mode — `mode: "nutrition_label"`
+
+Photographing the back of a box is a **reading** problem, not a recognition
+one. Meal mode's whole design — estimate the as-served portion, name the food
+so USDA can match it — produces a wrong answer there: there is no portion to
+estimate, and USDA returns a *generic* product whose macros are not this
+product's. That is how a tester's protein shake came back with macros that did
+not match its own printed label.
+
+So label mode reads. It makes **no USDA call**; the panel is the source.
+
+```json
+{
+  "mode": "nutrition_label",
+  "label": {
+    "product_name": "Chocolate Protein Bar",
+    "brand": "Acme",
+    "serving": {
+      "serving_size": 60.0,
+      "serving_size_unit": "g",
+      "household_serving": "1 bar",
+      "serving_size_grams": 60.0
+    },
+    "servings_per_container": 12.0,
+    "per_serving": {
+      "calories": 220.0, "protein": 20.0, "carbs": 24.0, "fat": 7.0,
+      "fiber": null, "sugar": 0.0, "sodium": 190.0
+    },
+    "micronutrients_per_serving": { "calcium": 500.0 }
+  },
+  "foods": [
+    {
+      "name": "Acme Chocolate Protein Bar",
+      "portion_grams": 100.0,
+      "confidence": 1.0,
+      "macros": {
+        "calories": 367, "protein": 33.3, "carbs": 40.0, "fat": 11.7,
+        "fiber": null, "sugar": 0.0, "sodium": 317
+      },
+      "micronutrients": { "calcium": 833.33 },
+      "source": "nutrition_label",
+      "usda_description": null,
+      "fdc_id": null,
+      "brand": "Acme",
+      "data_type": "Nutrition label",
+      "gtin_upc": null,
+      "serving": { "…": "as above" },
+      "basis": "per_100g"
+    }
+  ],
+  "totals": { "…": "the sum over foods[], i.e. the per-100 g basis" },
+  "needs_confirmation": false,
+  "confirmation_reason": null,
+  "confidence": 0.93,
+  "model": "claude-sonnet-5",
+  "analysis_version": "2.0.0-claude-usda",
+  "usda_available": true,
+  "notes": "",
+  "warnings": [],
+  "analyzed_at": 1787873781.93
+}
+```
+
+Every key meal mode returns is still here and still means the same thing, so
+the client keeps one parser. `usda_available` reports whether the service is
+configured, not whether it was called — label mode never calls it.
+
+#### `label` — the panel as printed
+
+| Field | Type | Notes |
+|---|---|---|
+| `product_name` | string \| null | As printed. |
+| `brand` | string \| null | As printed. |
+| `serving` | object \| null | Same four keys `/search_food` and `/barcode` use. `null` when the panel declares no serving at all — never a guessed 100 g. |
+| `servings_per_container` | number \| null | `null` when the panel does not say. **Not defaulted to 1** — that would silently halve a two-serving container. |
+| `per_serving` | object | The seven macros **per serving, exactly as printed**. Not converted, not multiplied by the servings per container. |
+| `micronutrients_per_serving` | object | Sparse: only rows printed as an amount. A `%DV` with no amount is not converted into one. |
+
+`serving.serving_size_grams` is `null` unless the printed unit converts
+cleanly — the same `g`/`ml` rule `/search_food` already applies — so "1 scoop"
+and "1 bar" are displayed, never turned into a weight.
+
+#### Per serving → per 100 g
+
+**This is the conversion the whole mode turns on.** A label states everything
+per serving; every `foods[]` entry in this API is per 100 g, with
+`portion_grams` as the basis the client rescales from. Passing a 60 g bar's
+printed 20 g of protein straight through as a per-100 g figure understates it
+by 40%:
+
+```
+per_100g = per_serving × 100 / serving_size_grams
+20 g protein in a 60 g bar → 20 × 100 / 60 = 33.3 g per 100 g
+```
+
+`foods[0]` carries the converted figures; `label.per_serving` carries the
+printed ones. Both are returned so the client can show the panel and log the
+portion without doing arithmetic on the wrong basis.
+
+**Without `serving.serving_size_grams` there is no conversion, and none is
+invented.** The response then has `foods: []`, the `label` block still
+populated, and `needs_confirmation: true` explaining that the panel gave no
+serving weight — the user should re-shoot including the serving-size line.
+
+#### `null` versus `0`
+
+A row the panel does not print is `null` in both `label.per_serving` and
+`foods[0].macros`. A row printed as `0 g` is `0.0`. These never collapse into
+each other: reporting `0` for a nutrient the package never claimed is a
+fabricated number, and it is the one that would be hardest for a user to
+notice.
+
+#### When label mode asks for confirmation
+
+`needs_confirmation` is `true` when:
+
+- No panel was found, or it was too blurry, cropped, angled or dark to read —
+  `confirmation_reason` carries the model's own explanation.
+- The panel was read but printed no serving weight in grams (see above).
+- `confidence` in the transcription is below `MIN_CONFIDENCE` (default 0.5).
+- No calorie figure was printed — the same rule `/barcode` applies to a
+  product with no nutrition data on file.
+
+An unreadable panel **never** produces a guessed number. It produces this, or
+an `error.kind` of `refusal`.
 
 ### Failure responses
 
@@ -206,7 +345,7 @@ manual-entry editor rather than any invented number.
 
 | `error.kind` | HTTP | `retryable` | Meaning |
 |---|---|---|---|
-| `bad_request` | 400 | false | Missing, malformed, oversized, or unsupported image. |
+| `bad_request` | 400 | false | Missing, malformed, oversized, or unsupported image; or an unrecognised `mode`. |
 | `refusal` | 200 | false | The model declined this image. Ask for a different photo. |
 | `rate_limit` | 200 | true | Rate limited upstream. Back off and retry. |
 | `upstream_error` | 200 | true | Claude 5xx. |
@@ -215,6 +354,13 @@ manual-entry editor rather than any invented number.
 | `auth` | 500 | false | Bad credentials. Operator problem, not a user problem. |
 | `misconfigured` | 500 | false | SDK or key missing on the server. Operator problem. |
 | `internal_error` | 500 | true | Unexpected. |
+
+A label-mode failure carries `mode: "nutrition_label"` alongside the `error`
+object. Without it a refusal to read a panel would be indistinguishable from a
+server that has never heard of label mode, and the user would be told the
+feature is unavailable instead of being told what was wrong with the photo.
+The one exception is an unrecognised `mode` itself, which has no valid mode to
+echo.
 
 Client rule: **retry only when `retryable` is `true`**, with backoff. On a
 non-retryable failure, show `confirmation_reason` and offer manual entry.
