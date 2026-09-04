@@ -25,7 +25,9 @@ set, never its value.
 from __future__ import annotations
 
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import claude_vision
 import openfoodfacts_client
@@ -51,6 +53,16 @@ OPTIONAL_ENV_VARS = (
 DEFAULT_MAX_MEAL_CALORIES = 2500.0
 DEFAULT_MIN_CONFIDENCE = 0.5
 DEFAULT_MAX_FOOD_PORTION_GRAMS = 1500.0
+
+# How many USDA lookups one meal may have in flight at once.
+#
+# The lookups are blocking HTTP waits, not computation, so threads are the
+# right tool and the GIL is not a factor. The number is a deliberate ceiling
+# rather than "one thread per food": a photo of a buffet can detect a dozen
+# items, and neither our socket budget nor USDA's rate limit should scale with
+# how busy the plate was. Four covers the overwhelmingly common 1-4 item meal
+# in a single round-trip's worth of wall time.
+USDA_LOOKUP_WORKERS = 4
 
 
 def _env_float(name: str, default: float) -> float:
@@ -305,7 +317,104 @@ def build_response(
 
 # --- USDA enrichment --------------------------------------------------------
 
-def enrich_with_usda(detected_foods: list, lookup=None) -> tuple[list, bool, list]:
+def _prepare_foods(detected_foods: list) -> list:
+    """Filter and normalize the model's food list before any lookup runs.
+
+    Malformed and nameless entries are dropped here, so the surviving list is
+    positionally stable: index ``i`` of the result is index ``i`` of the
+    lookups and of the returned ``foods``.
+    """
+    prepared: list = []
+    for raw in detected_foods:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        if not name:
+            continue
+        grams, was_clamped = clamp_portion(raw.get("estimated_portion_grams"))
+        prepared.append(
+            {
+                "raw": raw,
+                "name": name,
+                "grams": grams,
+                "was_clamped": was_clamped,
+                "query": str(raw.get("usda_query") or name).strip() or name,
+            }
+        )
+    return prepared
+
+
+def _lookup_one(item: dict, lookup):
+    """The lookup sequence for a single food: the model's USDA query first,
+    then its display name if that missed. Identical to what the serial loop
+    did per food -- only *where* it runs has changed."""
+    record = lookup(item["query"])
+    if record is None and item["query"].lower() != item["name"].lower():
+        record = lookup(item["name"])
+    return record
+
+
+def _lookup_warning(error: BaseException) -> str:
+    if isinstance(error, UsdaUnavailable):
+        return f"USDA lookup unavailable: {error}"
+    return f"USDA lookup error: {error}"
+
+
+def _lookup_in_parallel(prepared: list, lookup, max_workers: int) -> list:
+    """Look every prepared food up concurrently.
+
+    Returns one ``(record, error)`` pair per food, **positionally** -- the list
+    is indexed by the food's position in the meal, never by which lookup
+    finished first. Exceptions are captured rather than raised so that one
+    food's failure cannot cancel the rest; deciding what a failure *means* is
+    left to the caller, which walks the results in meal order.
+
+    ``first_failure`` is an optimisation only. Once a food has failed, every
+    food after it is reported as estimated regardless of what its own lookup
+    returns (that is the pre-existing rule), so a later food that has not
+    started yet may as well skip the call instead of hammering a service
+    already known to be down. It is compared by index, so it can never cause
+    an *earlier* food to skip a call whose result would have been used.
+    """
+    results: list = [(None, None)] * len(prepared)
+    if not prepared:
+        return results
+
+    if len(prepared) == 1:
+        # A single food is not worth the cost of standing up a pool.
+        try:
+            results[0] = (_lookup_one(prepared[0], lookup), None)
+        except Exception as exc:  # defensive: never fail the whole meal
+            results[0] = (None, exc)
+        return results
+
+    state_lock = threading.Lock()
+    first_failure: list = [None]
+
+    def run(index: int):
+        with state_lock:
+            failed_at = first_failure[0]
+        if failed_at is not None and index > failed_at:
+            return None, None
+        try:
+            return _lookup_one(prepared[index], lookup), None
+        except Exception as exc:  # defensive: never fail the whole meal
+            with state_lock:
+                if first_failure[0] is None or index < first_failure[0]:
+                    first_failure[0] = index
+            return None, exc
+
+    workers = max(1, min(max_workers, len(prepared)))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="usda") as pool:
+        # ``Executor.map`` yields in submission order, not completion order,
+        # which is exactly the ordering guarantee the response contract needs.
+        results = list(pool.map(run, range(len(prepared))))
+    return results
+
+
+def enrich_with_usda(
+    detected_foods: list, lookup=None, *, max_workers: int | None = None
+) -> tuple[list, bool, list]:
     """Attach macros to each detected food.
 
     ``lookup`` is injected for testing; it defaults to :func:`usda_client.lookup`.
@@ -314,40 +423,43 @@ def enrich_with_usda(detected_foods: list, lookup=None) -> tuple[list, bool, lis
     A food that USDA cannot supply falls back to the model's own per-100 g
     estimate and is labelled ``source: "estimated"``. Micronutrients are never
     estimated -- an estimated food carries an empty micronutrient map.
+
+    The lookups run concurrently (see :func:`_lookup_in_parallel`), because
+    each one is a blocking HTTP wait and a four-food meal used to pay for four
+    of them end to end. The results are then folded back together **in meal
+    order** by the loop below, which is what keeps every observable outcome --
+    ordering, warnings, and the "first failure disables USDA for the rest of
+    the meal" rule -- identical to the serial version.
     """
     if lookup is None:
         lookup = usda_client.lookup
+    if max_workers is None:
+        max_workers = USDA_LOOKUP_WORKERS
+
+    prepared = _prepare_foods(detected_foods)
+    results = _lookup_in_parallel(prepared, lookup, max_workers)
 
     foods: list = []
     warnings: list[str] = []
     usda_available = True
 
-    for raw in detected_foods:
-        if not isinstance(raw, dict):
-            continue
-        name = str(raw.get("name") or "").strip()
-        if not name:
-            continue
+    for item, (record, error) in zip(prepared, results):
+        name = item["name"]
+        grams = item["grams"]
+        was_clamped = item["was_clamped"]
 
-        grams, was_clamped = clamp_portion(raw.get("estimated_portion_grams"))
-        query = str(raw.get("usda_query") or name).strip() or name
-
-        record = None
-        if usda_available:
-            try:
-                record = lookup(query)
-                if record is None and query.lower() != name.lower():
-                    record = lookup(name)
-            except UsdaUnavailable as exc:
-                # First failure disables USDA for the rest of this meal --
-                # no point retrying a down service once per food.
-                usda_available = False
-                warnings.append(f"USDA lookup unavailable: {exc}")
-                record = None
-            except Exception as exc:  # defensive: never fail the whole meal
-                usda_available = False
-                warnings.append(f"USDA lookup error: {exc}")
-                record = None
+        if not usda_available:
+            # A food earlier in the meal already failed. Serially this food
+            # would never have been looked up at all, so whatever its own
+            # concurrent lookup returned is discarded and it falls back to the
+            # estimate -- same outcome, same warning count.
+            record = None
+        elif error is not None:
+            # First failure disables USDA for the rest of this meal -- no
+            # point retrying a down service once per food.
+            usda_available = False
+            warnings.append(_lookup_warning(error))
+            record = None
 
         if record and record.get("per_100g"):
             macros = scale_macros(record["per_100g"], grams)
@@ -356,6 +468,7 @@ def enrich_with_usda(detected_foods: list, lookup=None) -> tuple[list, bool, lis
             usda_description = record.get("description")
             fdc_id = record.get("fdc_id")
         else:
+            raw = item["raw"]
             estimate = {
                 "calories": raw.get("estimated_calories_per_100g"),
                 "protein": raw.get("estimated_protein_per_100g"),
@@ -378,7 +491,7 @@ def enrich_with_usda(detected_foods: list, lookup=None) -> tuple[list, bool, lis
                 "name": name,
                 "portion_grams": grams,
                 "portion_clamped": was_clamped,
-                "confidence": clamp_confidence(raw.get("confidence")),
+                "confidence": clamp_confidence(item["raw"].get("confidence")),
                 "macros": macros,
                 "micronutrients": micros,
                 "source": source,
