@@ -210,5 +210,12 @@ def run(platform: str, default_port: int) -> None:
     # Threading matters here: a single analysis makes a Claude call plus one
     # USDA call per food, so a single-threaded server would serialize users
     # behind each other for seconds at a time.
+    #
+    # Each in-flight analysis additionally runs up to
+    # ``nutrition_analyzer.USDA_LOOKUP_WORKERS`` lookup threads of its own, so
+    # peak USDA concurrency is (concurrent analyses x that bound). The per-meal
+    # bound is what keeps that product finite as meals get longer; if the
+    # deploy platform ever needs a ceiling on the first factor too, cap it here
+    # rather than by shrinking the per-meal pool.
     server = ThreadingHTTPServer(("0.0.0.0", port), NutritionRequestHandler)
     server.serve_forever()
