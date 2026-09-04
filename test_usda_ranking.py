@@ -7,6 +7,8 @@ stubbed at ``usda_client._raw_search``.
 
 from __future__ import annotations
 
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -422,6 +424,188 @@ class UnavailableTests(unittest.TestCase):
         ):
             with self.assertRaises(uc.UsdaUnavailable):
                 uc.lookup_barcode("888849000371")
+
+
+class ConcurrentCacheTests(unittest.TestCase):
+    """The cache is now read and written from several threads at once.
+
+    ``/analyze_food`` looks a meal's foods up in parallel and both deploy
+    entrypoints run a threading HTTP server, so "two callers want the same
+    food at the same moment" is the normal case rather than a rarity.
+    """
+
+    def setUp(self):
+        uc.clear_cache()
+
+    def tearDown(self):
+        uc.clear_cache()
+
+    @staticmethod
+    def _run_concurrently(work, threads):
+        """Fire ``threads`` copies of ``work`` as simultaneously as possible."""
+        start = threading.Barrier(threads)
+        results: list = [None] * threads
+        errors: list = [None] * threads
+
+        def runner(index):
+            start.wait()
+            try:
+                results[index] = work()
+            except BaseException as exc:  # recorded, then re-raised by the test
+                errors[index] = exc
+
+        workers = [
+            threading.Thread(target=runner, args=(i,)) for i in range(threads)
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
+        return results, errors
+
+    def test_simultaneous_lookups_of_one_food_make_one_upstream_call(self):
+        calls = []
+        calls_lock = threading.Lock()
+
+        def slow(query, timeout):
+            with calls_lock:
+                calls.append(query)
+            time.sleep(0.05)
+            return {"per_100g": {"calories": 165.0}, "description": "chicken"}
+
+        with mock.patch.object(uc, "_search_uncached", side_effect=slow):
+            results, errors = self._run_concurrently(
+                lambda: uc.lookup("Chicken Breast"), threads=8
+            )
+
+        self.assertEqual(errors, [None] * 8)
+        self.assertEqual(len(calls), 1, "single-flight did not collapse the calls")
+        # Every caller got the same answer, and it is the real one.
+        for result in results:
+            self.assertIs(result, results[0])
+            self.assertEqual(result["description"], "chicken")
+
+    def test_every_concurrent_caller_is_counted_exactly_once(self):
+        with mock.patch.object(
+            uc,
+            "_search_uncached",
+            side_effect=lambda query, timeout: (time.sleep(0.02) or {"per_100g": {}}),
+        ):
+            self._run_concurrently(lambda: uc.lookup("chicken breast"), threads=10)
+
+        stats = uc.cache_stats()
+        self.assertEqual(stats["entries"], 1)
+        self.assertEqual(stats["misses"], 1)  # misses == upstream calls
+        self.assertEqual(stats["hits"], 9)    # everyone else was served free
+
+    def test_a_cached_none_is_shared_not_recomputed(self):
+        """"USDA has no match" is a real answer and must be cached like one --
+        membership decides a hit, not truthiness."""
+        calls = []
+        calls_lock = threading.Lock()
+
+        def miss(query, timeout):
+            with calls_lock:
+                calls.append(query)
+            time.sleep(0.02)
+            return None
+
+        with mock.patch.object(uc, "_search_uncached", side_effect=miss):
+            results, errors = self._run_concurrently(
+                lambda: uc.lookup("ackee"), threads=6
+            )
+            uc.lookup("ackee")  # and again, after everyone has finished
+
+        self.assertEqual(errors, [None] * 6)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(results, [None] * 6)
+
+    def test_a_failure_is_shared_but_never_cached(self):
+        """Waiters see the failure rather than each re-dialling a dead service,
+        but the key must not stay poisoned once USDA recovers."""
+        calls = []
+        calls_lock = threading.Lock()
+
+        def flaky(query, timeout):
+            with calls_lock:
+                calls.append(query)
+                first = len(calls) == 1
+            time.sleep(0.02)
+            if first:
+                raise uc.UsdaUnavailable("USDA returned HTTP 503.")
+            return {"per_100g": {"calories": 165.0}}
+
+        with mock.patch.object(uc, "_search_uncached", side_effect=flaky):
+            _, errors = self._run_concurrently(
+                lambda: uc.lookup("chicken"), threads=5
+            )
+            recovered = uc.lookup("chicken")
+
+        self.assertEqual(len(calls), 2, "the outage was retried once, not per waiter")
+        for error in errors:
+            self.assertIsInstance(error, uc.UsdaUnavailable)
+        self.assertEqual(recovered["per_100g"]["calories"], 165.0)
+        # Nothing was cached for the failed attempt.
+        self.assertEqual(uc.cache_stats()["entries"], 1)
+
+    def test_distinct_foods_do_not_block_each_other(self):
+        """Single-flight keys on the food, so different foods still overlap."""
+        live = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def slow(query, timeout):
+            nonlocal live, peak
+            with lock:
+                live += 1
+                peak = max(peak, live)
+            time.sleep(0.05)
+            with lock:
+                live -= 1
+            return {"per_100g": {"calories": 1.0}, "description": query}
+
+        names = ["rice", "beans", "plantain", "chicken"]
+        with mock.patch.object(uc, "_search_uncached", side_effect=slow):
+            barrier = threading.Barrier(len(names))
+            seen: dict = {}
+
+            def runner(name):
+                barrier.wait()
+                seen[name] = uc.lookup(name)
+
+            threads = [threading.Thread(target=runner, args=(n,)) for n in names]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(peak, len(names))
+        self.assertEqual(sorted(seen), sorted(names))
+        for name in names:
+            self.assertEqual(seen[name]["description"], name)
+
+    def test_search_and_barcode_are_single_flighted_too(self):
+        for label, call, payload in (
+            ("search", lambda: uc.search_foods("chicken"), {"foods": []}),
+            ("barcode", lambda: uc.lookup_barcode("888849000371"), {"foods": []}),
+        ):
+            with self.subTest(endpoint=label):
+                uc.clear_cache()
+                calls = []
+                calls_lock = threading.Lock()
+
+                def slow(*args, **kwargs):
+                    with calls_lock:
+                        calls.append(1)
+                    time.sleep(0.05)
+                    return payload
+
+                with mock.patch.object(uc, "_raw_search", side_effect=slow):
+                    _, errors = self._run_concurrently(call, threads=6)
+
+                self.assertEqual(errors, [None] * 6)
+                # One flight. /search_food fetches both tiers inside it.
+                self.assertLessEqual(len(calls), 2)
 
 
 if __name__ == "__main__":
