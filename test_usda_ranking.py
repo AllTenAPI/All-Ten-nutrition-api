@@ -426,6 +426,79 @@ class UnavailableTests(unittest.TestCase):
                 uc.lookup_barcode("888849000371")
 
 
+class SearchTierConcurrencyTests(unittest.TestCase):
+    """``/search_food`` always needs both tiers, so it should not pay for them
+    end to end."""
+
+    def setUp(self):
+        uc.clear_cache()
+
+    def tearDown(self):
+        uc.clear_cache()
+
+    def test_both_tiers_are_fetched_at_once(self):
+        live = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def slow(query, timeout, **kwargs):
+            nonlocal live, peak
+            with lock:
+                live += 1
+                peak = max(peak, live)
+            time.sleep(0.05)
+            with lock:
+                live -= 1
+            return {"foods": [], "totalHits": 0, "totalPages": 0}
+
+        with mock.patch.object(uc, "_raw_search", side_effect=slow):
+            uc.search_foods("chicken")
+
+        self.assertEqual(peak, 2, "the two tiers were still fetched one after the other")
+
+    def test_the_generic_tier_failure_is_the_one_that_surfaces(self):
+        """Serially the generic tier ran first, so its failure was the one the
+        caller saw. Fetching both concurrently must not change which."""
+        def fail_generic(query, timeout, *, data_types, **kwargs):
+            if data_types == uc.GENERIC_DATA_TYPES:
+                raise uc.UsdaUnavailable("generic tier is down")
+            raise uc.UsdaUnavailable("branded tier is down")
+
+        with mock.patch.object(uc, "_raw_search", side_effect=fail_generic):
+            with self.assertRaises(uc.UsdaUnavailable) as ctx:
+                uc.search_foods("chicken")
+
+        self.assertIn("generic", str(ctx.exception))
+
+    def test_a_branded_only_failure_still_propagates(self):
+        def fail_branded(query, timeout, *, data_types, **kwargs):
+            if data_types == uc.BRANDED_DATA_TYPES:
+                raise uc.UsdaUnavailable("branded tier is down")
+            return {"foods": [], "totalHits": 0, "totalPages": 0}
+
+        with mock.patch.object(uc, "_raw_search", side_effect=fail_branded):
+            with self.assertRaises(uc.UsdaUnavailable) as ctx:
+                uc.search_foods("chicken")
+
+        self.assertIn("branded", str(ctx.exception))
+
+    def test_a_failed_search_is_not_cached(self):
+        attempts = []
+
+        def flaky(query, timeout, **kwargs):
+            attempts.append(1)
+            if len(attempts) <= 2:  # both tiers of the first attempt
+                raise uc.UsdaUnavailable("USDA returned HTTP 503.")
+            return {"foods": [], "totalHits": 0, "totalPages": 0}
+
+        with mock.patch.object(uc, "_raw_search", side_effect=flaky):
+            with self.assertRaises(uc.UsdaUnavailable):
+                uc.search_foods("chicken")
+            result = uc.search_foods("chicken")
+
+        self.assertEqual(result["records"], [])
+
+
 class ConcurrentCacheTests(unittest.TestCase):
     """The cache is now read and written from several threads at once.
 

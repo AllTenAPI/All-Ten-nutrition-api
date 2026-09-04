@@ -30,6 +30,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 SEARCH_URL = "https://api.nal.usda.gov/fdc/v1/foods/search"
 
@@ -574,17 +575,39 @@ def merge_tiers(generic: list, branded: list, limit: int) -> list:
 
 
 def _search_foods_uncached(query: str, page: int, limit: int, timeout: float) -> dict:
+    """Fetch both tiers and merge them into one page.
+
+    Unlike :func:`_search_uncached`, which consults Branded only when the
+    generic tiers came up empty, this always needs both -- the page is a quota
+    split between them. Two unconditional, independent HTTP waits is exactly
+    the shape worth overlapping, so they are fetched concurrently and the
+    caller pays for the slower one instead of the sum.
+
+    Failures are re-raised in tier order, so a caller sees the same exception
+    it saw when the generic tier was fetched first and the branded one never
+    ran at all.
+    """
+    tier_order = (GENERIC_DATA_TYPES, BRANDED_DATA_TYPES)
+
+    def fetch(data_types):
+        # Each tier is paged independently at the full page size; the quota
+        # split is applied when the two are merged, so an under-filled tier
+        # cannot leave the page short.
+        return _raw_search(
+            query, timeout, data_types=data_types, page_size=limit, page_number=page
+        )
+
+    with ThreadPoolExecutor(max_workers=len(tier_order), thread_name_prefix="usda-tier") as pool:
+        futures = [pool.submit(fetch, data_types) for data_types in tier_order]
+        # ``result()`` in tier order: whichever tier would have failed first
+        # serially is still the failure the caller sees.
+        payloads = [future.result() for future in futures]
+
     tiers: dict[str, list] = {}
     total_hits = 0
     tier_more = False
 
-    for data_types in (GENERIC_DATA_TYPES, BRANDED_DATA_TYPES):
-        # Each tier is paged independently at the full page size; the quota
-        # split is applied when the two are merged, so an under-filled tier
-        # cannot leave the page short.
-        payload = _raw_search(
-            query, timeout, data_types=data_types, page_size=limit, page_number=page
-        )
+    for data_types, payload in zip(tier_order, payloads):
         foods = payload.get("foods") or []
         tiers[data_types[0]] = [parse_food_record(food) for food in foods]
 
