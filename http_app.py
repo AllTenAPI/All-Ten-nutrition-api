@@ -148,13 +148,38 @@ class NutritionRequestHandler(BaseHTTPRequestHandler):
         image_data = data.get("image") or data.get("image_base64") or ""
         media_type = data.get("media_type") or data.get("mime_type")
 
+        # One endpoint, two modes -- not two endpoints. The request shape, the
+        # 5 MB image validation, the error envelope and the foods[] entry
+        # shape are identical either way, so a mode flag lets the client ship
+        # ahead of the server and light up when the server honours it.
+        raw_mode = data.get("mode")
         try:
-            payload, status = nutrition_analyzer.analyze_meal(image_data, media_type)
+            mode = nutrition_analyzer.normalize_mode(raw_mode)
+        except ValueError as exc:
+            self._send_json(
+                {
+                    "error": {
+                        "kind": "bad_request",
+                        "message": str(exc),
+                        "retryable": False,
+                    },
+                    "needs_confirmation": True,
+                    "confirmation_reason": str(exc),
+                },
+                status=400,
+            )
+            return
+
+        try:
+            payload, status = nutrition_analyzer.analyze_food(
+                image_data, media_type, mode, echo_mode=raw_mode is not None
+            )
         except Exception as exc:  # pragma: no cover - last-resort guard
             # Log the type, never the request body (it carries the image).
             print(f"ERROR: unhandled analyze_food failure: {type(exc).__name__}: {exc}")
             self._send_json(
-                {
+                ({"mode": mode} if raw_mode is not None else {})
+                | {
                     "error": {
                         "kind": "internal_error",
                         "message": "The analysis failed unexpectedly.",
