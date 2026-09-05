@@ -39,6 +39,28 @@ ANALYSIS_VERSION = "2.0.0-claude-usda"
 
 MACRO_FIELDS = ("calories", "protein", "carbs", "fat", "fiber", "sugar", "sodium")
 
+# The two things a photo sent to /analyze_food can be.
+#
+# ``meal``  -- a plate. Estimate the portion, match it to USDA. The default,
+#              and the only behaviour before label mode existed: a request
+#              that sends no ``mode`` gets byte-identical output to what it
+#              got before.
+# ``nutrition_label`` -- packaging. Read the printed panel; estimate nothing.
+MODE_MEAL = "meal"
+MODE_NUTRITION_LABEL = "nutrition_label"
+SUPPORTED_MODES = (MODE_MEAL, MODE_NUTRITION_LABEL)
+
+# The nutrient basis every foods[] entry in this app is reported on. A label
+# is printed per serving, so it has to be converted before it can go in one.
+REFERENCE_GRAMS = 100.0
+
+# Serving units that convert to the per-100 g basis without a guess. This is
+# deliberately the same set ``usda_client.parse_serving`` accepts, so a label
+# read and a USDA record agree on when ``serving_size_grams`` is knowable.
+# ``ml`` assumes 1 g/ml, which is the same assumption /search_food already
+# ships; "1 scoop", "1 bar" and "1 cup" convert to nothing and stay null.
+CONVERTIBLE_SERVING_UNITS = ("g", "gram", "grams", "ml")
+
 # Environment variable names the owner must set on the deploy platform.
 # Values are never read into the response -- only presence is reported.
 REQUIRED_ENV_VARS = ("ANTHROPIC_API_KEY", "USDA_FDC_API_KEY")
@@ -315,6 +337,398 @@ def build_response(
     }
 
 
+# --- nutrition label mode ---------------------------------------------------
+#
+# Everything from here to ``analyze_label`` is pure except the one vision
+# call, and none of it touches the meal path.
+
+def normalize_mode(value) -> str:
+    """Validate the request's ``mode``. Returns the mode to run.
+
+    Absent, null or blank means :data:`MODE_MEAL` -- every client shipped
+    before this feature existed sends no mode and must keep getting exactly
+    what it got before. Anything else unrecognised is a client bug worth a
+    400 rather than a silent fallback to meal mode: a caller that asked for a
+    label read and quietly got a portion estimate of a cardboard box is the
+    precise failure this feature exists to prevent.
+    """
+    if value is None:
+        return MODE_MEAL
+    if not isinstance(value, str):
+        raise ValueError(
+            f"'mode' must be a string, one of: {', '.join(SUPPORTED_MODES)}."
+        )
+    mode = value.strip().lower()
+    if not mode:
+        return MODE_MEAL
+    if mode not in SUPPORTED_MODES:
+        raise ValueError(
+            f"Unsupported mode {value.strip()!r}. Supported modes: "
+            f"{', '.join(SUPPORTED_MODES)}."
+        )
+    return mode
+
+
+def label_number(value):
+    """Coerce one printed figure to a float, or ``None``.
+
+    ``None`` means the panel did not print it. **That is not zero**, and the
+    two must never collapse into each other: a panel with no fibre row is
+    unknown fibre, while a printed "Dietary Fiber 0 g" is a real zero. So a
+    genuine 0 survives, and everything unusable -- absent, non-numeric, NaN,
+    negative -- becomes ``None``.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if result != result:  # NaN
+        return None
+    if result < 0:
+        return None
+    return result
+
+
+def _clean_text(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text or None
+
+
+def serving_grams(size, unit) -> float | None:
+    """The serving weight in grams, or ``None`` when it does not convert.
+
+    ``None`` is the honest answer for "1 scoop" or "1 bar". Guessing what a
+    scoop weighs would put a fabricated number underneath every macro on the
+    panel, because the whole per-100 g conversion divides by this figure.
+    """
+    grams = label_number(size)
+    if grams is None or grams <= 0:
+        return None
+    unit_text = (_clean_text(unit) or "").lower()
+    if unit_text not in CONVERTIBLE_SERVING_UNITS:
+        return None
+    return grams
+
+
+def parse_label_serving(reading: dict) -> dict | None:
+    """The serving block, in the same shape ``/search_food`` already emits.
+
+    ``None`` when the panel declared no serving at all -- never a guessed
+    100 g.
+    """
+    size = label_number(reading.get("serving_size"))
+    if size is not None and size <= 0:
+        size = None
+    unit = _clean_text(reading.get("serving_size_unit"))
+    household = _clean_text(reading.get("household_serving"))
+
+    if size is None and household is None:
+        return None
+
+    return {
+        "serving_size": size,
+        "serving_size_unit": unit,
+        "household_serving": household,
+        "serving_size_grams": serving_grams(size, unit),
+    }
+
+
+def label_per_serving(reading: dict) -> dict:
+    """The seven macros as printed, per serving. Absent rows stay ``None``."""
+    printed = reading.get("per_serving") or {}
+    return {field: label_number(printed.get(field)) for field in MACRO_FIELDS}
+
+
+def label_micronutrients_per_serving(reading: dict) -> dict:
+    """The printed micronutrient rows, per serving. Sparse: rows the panel
+    does not carry are absent rather than zero."""
+    printed = reading.get("micronutrients_per_serving") or {}
+    result = {}
+    for name, raw in sorted(printed.items()):
+        value = label_number(raw)
+        if value is not None:
+            result[str(name)] = value
+    return result
+
+
+def per_serving_to_per_100g(per_serving: dict, grams) -> dict | None:
+    """Convert a printed per-serving column to the app's per-100 g basis.
+
+    **This is the conversion the whole feature turns on.** Every other
+    ``foods[]`` entry in this system is per 100 g with ``portion_grams`` as
+    the basis, and the client rescales by ``macro x new_grams /
+    portion_grams``. A label is per *serving*. Passing a 60 g bar's printed
+    20 g of protein straight through as a per-100 g figure understates it by
+    40% -- the correct value is 20 x 100 / 60 = 33.3 g per 100 g.
+
+    Returns ``None`` when there is no serving weight to divide by. There is
+    no honest conversion without one, and inventing a basis here would
+    corrupt every number above it.
+    """
+    basis = label_number(grams)
+    if basis is None or basis <= 0:
+        return None
+
+    factor = REFERENCE_GRAMS / basis
+    return {
+        field: (None if value is None else float(value) * factor)
+        for field, value in ((f, per_serving.get(f)) for f in MACRO_FIELDS)
+    }
+
+
+def _micronutrients_per_100g(micros: dict, grams: float) -> dict:
+    factor = REFERENCE_GRAMS / float(grams)
+    return {name: float(value) * factor for name, value in micros.items()}
+
+
+def label_display_name(product_name, brand) -> str:
+    """Brand first, without repeating a brand the product name already
+    carries ("Acme" + "Acme Protein Bar" is "Acme Protein Bar")."""
+    name = _clean_text(product_name) or ""
+    make = _clean_text(brand) or ""
+    if not name and not make:
+        return "Packaged food"
+    if not make:
+        return name
+    if not name:
+        return make
+    if name.lower().startswith(make.lower()):
+        return name
+    return f"{make} {name}"
+
+
+def build_label_facts(reading: dict) -> dict:
+    """The ``label`` block: the panel as printed, before any conversion."""
+    return {
+        "product_name": _clean_text(reading.get("product_name")),
+        "brand": _clean_text(reading.get("brand")),
+        "serving": parse_label_serving(reading),
+        "servings_per_container": label_number(reading.get("servings_per_container")),
+        "per_serving": label_per_serving(reading),
+        "micronutrients_per_serving": label_micronutrients_per_serving(reading),
+    }
+
+
+def build_label_food_entry(label: dict) -> dict | None:
+    """The panel as one ``foods[]`` entry on the per-100 g basis.
+
+    ``None`` when the panel gave no serving weight, or carried no macro at
+    all. The client is told why via ``needs_confirmation`` rather than handed
+    an entry built on a guess.
+    """
+    serving = label.get("serving") or {}
+    grams = serving.get("serving_size_grams")
+    per_serving = label.get("per_serving") or {}
+
+    if grams is None:
+        return None
+    if all(per_serving.get(field) is None for field in MACRO_FIELDS):
+        return None
+
+    per_100g = per_serving_to_per_100g(per_serving, grams)
+    micros_100g = _micronutrients_per_100g(
+        label.get("micronutrients_per_serving") or {}, grams
+    )
+
+    return {
+        # -- identical to /analyze_food's foods[] entries -------------------
+        "name": label_display_name(label.get("product_name"), label.get("brand")),
+        # The reference basis, exactly as /search_food and /barcode report it,
+        # so the client's existing portion arithmetic works unchanged.
+        "portion_grams": REFERENCE_GRAMS,
+        # A printed panel is not a probabilistic match. Whatever uncertainty
+        # exists is in the reading of it, and that is reported separately as
+        # the response-level confidence.
+        "confidence": 1.0,
+        "macros": scale_macros(per_100g, REFERENCE_GRAMS),
+        "micronutrients": scale_micronutrients(micros_100g, REFERENCE_GRAMS),
+        "source": "nutrition_label",
+        "usda_description": None,
+        "fdc_id": None,
+        # -- additive, matching /search_food and /barcode -------------------
+        "brand": label.get("brand"),
+        "data_type": "Nutrition label",
+        "gtin_upc": None,
+        "serving": label.get("serving"),
+        "basis": "per_100g",
+    }
+
+
+def evaluate_label_confirmation(
+    label: dict,
+    foods: list,
+    overall_confidence: float,
+    *,
+    unreadable_reason: str | None = None,
+    confidence_floor: float | None = None,
+) -> tuple[bool, str | None]:
+    """Decide whether a label read must be confirmed before it is logged.
+
+    Deliberately separate from :func:`evaluate_confirmation`: that one's rules
+    are about estimation ("no USDA match, so these are model estimates"),
+    which say nothing about a panel that was read off packaging.
+    """
+    if confidence_floor is None:
+        confidence_floor = min_confidence()
+
+    if unreadable_reason:
+        return True, unreadable_reason
+
+    per_serving = (label or {}).get("per_serving") or {}
+    has_any_macro = any(per_serving.get(field) is not None for field in MACRO_FIELDS)
+
+    if not has_any_macro:
+        return True, (
+            "No nutrition panel could be read in this photo. Point the camera "
+            "at the nutrition facts label, or enter the values manually."
+        )
+
+    if not foods:
+        # The panel was read, but it printed no serving weight in grams, so
+        # there is nothing to convert against. Worth its own message: the fix
+        # is to re-shoot including the serving-size line, not to re-shoot the
+        # panel.
+        return True, (
+            "The panel was read, but it does not state a serving weight in "
+            "grams, so the printed values cannot be converted to a portion. "
+            "Check the numbers and set the weight yourself."
+        )
+
+    reasons: list[str] = []
+
+    if overall_confidence < confidence_floor:
+        reasons.append(
+            f"Confidence in the label reading {overall_confidence:.2f} is below "
+            f"the {confidence_floor:.2f} threshold"
+        )
+
+    if per_serving.get("calories") is None:
+        # Same rule /barcode applies to a product with no calorie figure on
+        # file: show it, but make the user supply the missing number.
+        reasons.append(
+            "No calorie figure was printed on the panel; enter it from the "
+            "package"
+        )
+
+    if not reasons:
+        return False, None
+    return True, "; ".join(reasons) + "."
+
+
+def build_label_response(
+    label: dict,
+    foods: list,
+    overall_confidence: float,
+    model: str,
+    *,
+    unreadable_reason: str | None = None,
+    notes: str = "",
+    warnings: list | None = None,
+) -> dict:
+    """The label-mode response: the meal envelope, plus ``mode`` and ``label``.
+
+    Every key ``/analyze_food`` already returns is still here and still means
+    the same thing, so the client's single parser handles both modes. ``totals``
+    is the sum over ``foods[]``, which in this mode is the per-100 g basis
+    rather than a meal total -- there is no meal, only a product.
+    """
+    totals = aggregate_totals(foods)
+    totals["micronutrients"] = aggregate_micronutrients(foods)
+
+    needs_confirmation, reason = evaluate_label_confirmation(
+        label,
+        foods,
+        overall_confidence,
+        unreadable_reason=unreadable_reason,
+    )
+
+    return {
+        "mode": MODE_NUTRITION_LABEL,
+        "label": label,
+        "foods": foods,
+        "totals": totals,
+        "needs_confirmation": needs_confirmation,
+        "confirmation_reason": reason,
+        "confidence": _round(clamp_confidence(overall_confidence), 2),
+        "model": model,
+        "analysis_version": ANALYSIS_VERSION,
+        # No USDA call is made in this mode -- the panel is the source. The
+        # flag still reports whether the service is configured, so it never
+        # implies an outage that did not happen.
+        "usda_available": usda_client.is_configured(),
+        "notes": notes or "",
+        "warnings": list(warnings or []),
+        "analyzed_at": time.time(),
+    }
+
+
+def analyze_label(image_data: str, media_type: str | None = None) -> tuple[dict, int]:
+    """Read one nutrition-label photo. Returns ``(response_body, http_status)``.
+
+    Same failure contract as :func:`analyze_meal`: nothing raises for an
+    expected failure, and every failure comes back with
+    ``needs_confirmation: true`` rather than a guessed number.
+    """
+    try:
+        reading = claude_vision.read_nutrition_label(image_data, media_type)
+    except VisionRefusal as exc:
+        return _failure_response(
+            str(exc),
+            model=claude_vision.model_id(),
+            kind="refusal",
+            retryable=False,
+            mode=MODE_NUTRITION_LABEL,
+        ), 200
+    except VisionError as exc:
+        status = 400 if exc.kind == "bad_request" else 200
+        if exc.kind in ("misconfigured", "auth"):
+            status = 500
+        return _failure_response(
+            exc.message,
+            model=claude_vision.model_id(),
+            kind=exc.kind,
+            retryable=exc.retryable,
+            mode=MODE_NUTRITION_LABEL,
+        ), status
+    except Exception as exc:  # pragma: no cover - unexpected
+        print(f"ERROR: unexpected failure in label step: {type(exc).__name__}: {exc}")
+        return _failure_response(
+            "Reading the nutrition label failed unexpectedly. Please try again "
+            "or add the item manually.",
+            model=claude_vision.model_id(),
+            kind="internal_error",
+            retryable=True,
+            mode=MODE_NUTRITION_LABEL,
+        ), 500
+
+    label = build_label_facts(reading)
+
+    unreadable_reason = None
+    if not reading.get("panel_found"):
+        unreadable_reason = _clean_text(reading.get("unreadable_reason")) or (
+            "No readable nutrition panel was found in this photo. Try a "
+            "straight-on, well-lit shot of the whole panel."
+        )
+
+    entry = None if unreadable_reason else build_label_food_entry(label)
+
+    return (
+        build_label_response(
+            label,
+            [entry] if entry else [],
+            clamp_confidence(reading.get("confidence")),
+            reading.get("model") or claude_vision.model_id(),
+            unreadable_reason=unreadable_reason,
+            notes=str(reading.get("notes") or ""),
+        ),
+        200,
+    )
+
+
 # --- USDA enrichment --------------------------------------------------------
 
 def _prepare_foods(detected_foods: list) -> list:
@@ -505,6 +919,32 @@ def enrich_with_usda(
 
 # --- public entrypoint ------------------------------------------------------
 
+def analyze_food(
+    image_data: str,
+    media_type: str | None = None,
+    mode: str = MODE_MEAL,
+    *,
+    echo_mode: bool = False,
+) -> tuple[dict, int]:
+    """Dispatch one ``/analyze_food`` request to the mode it asked for.
+
+    ``echo_mode`` controls whether a **meal** response carries a ``mode`` key.
+    It is off by default so that a request sending no ``mode`` -- every client
+    built before this feature -- gets output byte-identical to what it got
+    before. A caller that explicitly asked for ``"meal"`` gets the echo, since
+    it is asking a question the old server could not answer. Label mode always
+    echoes: the client treats the echo as its proof the flag was honoured, and
+    refuses to call anything "read from the label" without it.
+    """
+    if mode == MODE_NUTRITION_LABEL:
+        return analyze_label(image_data, media_type)
+
+    payload, status = analyze_meal(image_data, media_type)
+    if echo_mode:
+        payload["mode"] = MODE_MEAL
+    return payload, status
+
+
 def analyze_meal(image_data: str, media_type: str | None = None) -> tuple[dict, int]:
     """Analyze one meal photo. Returns ``(response_body, http_status)``.
 
@@ -553,11 +993,25 @@ def analyze_meal(image_data: str, media_type: str | None = None) -> tuple[dict, 
     )
 
 
-def _failure_response(message: str, *, model: str, kind: str, retryable: bool) -> dict:
+def _failure_response(
+    message: str,
+    *,
+    model: str,
+    kind: str,
+    retryable: bool,
+    mode: str | None = None,
+) -> dict:
     """An empty but well-shaped response. The client renders the same editor
     and asks the user to enter the meal, rather than showing invented numbers.
+
+    ``mode`` is echoed on label-mode failures too. The client's gate is the
+    echo, so without it a refusal to read a panel would be indistinguishable
+    from a server that has never heard of label mode -- and the user would be
+    told the feature is unavailable instead of being told what was wrong with
+    the photo.
     """
-    return {
+    body = {} if mode is None else {"mode": mode}
+    return body | {
         "foods": [],
         "totals": {field: None for field in MACRO_FIELDS} | {"micronutrients": {}},
         "needs_confirmation": True,
