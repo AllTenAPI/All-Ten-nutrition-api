@@ -165,30 +165,32 @@ LABEL_SYSTEM_PROMPT = (
     "- Report the macro column PER SERVING, exactly as printed. Do not "
     "convert it to per 100 g, do not multiply it by the servings per "
     "container, and do not recompute it.\n"
-    "- If a row is not printed on the panel, return null for it. NEVER return "
-    "0 for a row you cannot see. A printed '0 g' is 0; an absent row is null. "
-    "This distinction matters more than completeness.\n"
+    "- If a row is not printed on the panel, OMIT that field entirely. NEVER "
+    "return 0 for a row you cannot see, and do not send an empty value: a "
+    "printed '0 g' is 0, and an absent row is a missing key. This distinction "
+    "matters more than completeness -- a field you leave out is understood as "
+    "'the panel does not print it'.\n"
     "- Do not calculate a missing row from the others (for example, do not "
-    "derive calories from the macros). An unprinted row is null.\n"
+    "derive calories from the macros). An unprinted row is left out.\n"
     "- serving_size and serving_size_unit are the serving as printed. When "
     "the panel gives both a household measure and a metric weight -- "
     "'1 bar (60 g)', '2 tbsp (32 g)' -- put the metric figure in "
     "serving_size/serving_size_unit and the household measure in "
     "household_serving. When only a household measure is printed ('1 scoop', "
-    "'1 bar' with no gram weight), leave serving_size and serving_size_unit "
-    "null. Do not estimate what a scoop weighs.\n"
+    "'1 bar' with no gram weight), omit serving_size and serving_size_unit "
+    "entirely. Do not estimate what a scoop weighs.\n"
     "- Units: calories in kcal (use the kcal figure if both kJ and kcal are "
     "printed), protein/carbs/fat/fiber/sugar in grams, sodium in "
     "milligrams. Carbs means total carbohydrate; sugar means total sugars. "
     "Convert a printed unit to these units only when the conversion is "
     "arithmetic and certain (for example 1 g sodium = 1000 mg); otherwise "
-    "return null.\n"
+    "omit the field.\n"
     "- Micronutrients: report the printed AMOUNT per serving in the stated "
-    "unit (mg or mcg), never the %DV. If only a %DV is printed, return null "
+    "unit (mg or mcg), never the %DV. If only a %DV is printed, omit the field "
     "for that nutrient.\n"
     "- If there is no nutrition panel in the photo, or it is too blurry, "
     "cropped, angled or dark to read, set panel_found to false and explain "
-    "briefly in unreadable_reason. Return nulls rather than a guess. A "
+    "briefly in unreadable_reason. Omit fields rather than guess at them. A "
     "refusal to read is a correct answer; an invented number is not.\n"
     "- Report honest confidence in the transcription. Glare, a curved "
     "surface, or a partially cropped panel should lower it."
@@ -226,13 +228,28 @@ _LABEL_MACROS = (
 )
 
 
-def _nullable(json_type: str, description: str) -> dict:
-    """A schema node that is explicitly allowed to be null.
+def _optional(json_type: str, description: str) -> dict:
+    """A schema node for a figure that may simply not be on the panel.
 
-    Nullability is the whole point of this mode: a panel that does not print
-    a row must come back as ``null``, never as ``0``.
+    "A row the panel does not print is unknown, never zero" is the whole point
+    of this mode, and it used to be expressed as ``{"type": [t, "null"]}`` with
+    the key required. That is a union type, and the API caps a schema at 16
+    parameters carrying unions:
+
+        400 invalid_request_error - Schemas contains too many parameters with
+        union types (24 parameters with type arrays or anyOf) ... limit: 16
+
+    Six top-level fields plus seven macros plus eleven micronutrients is
+    exactly 24, so **every** label scan was rejected before it reached the
+    model -- not an intermittent failure, a permanent one.
+
+    An absent key carries the same meaning as an explicit null and costs no
+    union: the readers go through ``dict.get``, which returns ``None`` either
+    way, and ``label_number`` maps that to ``None``. So the field is declared
+    with a single type and left out of ``required``, and the prompt asks for
+    the key to be omitted rather than nulled.
     """
-    return {"type": [json_type, "null"], "description": description}
+    return {"type": json_type, "description": description}
 
 
 NUTRITION_LABEL_SCHEMA = {
@@ -254,20 +271,20 @@ NUTRITION_LABEL_SCHEMA = {
                 "when the panel was read."
             ),
         },
-        "product_name": _nullable("string", "Product name as printed, or null."),
-        "brand": _nullable("string", "Brand or manufacturer as printed, or null."),
-        "serving_size": _nullable(
+        "product_name": _optional("string", "Product name as printed. Omit if not printed."),
+        "brand": _optional("string", "Brand or manufacturer as printed. Omit if not printed."),
+        "serving_size": _optional(
             "number",
             "Numeric serving size as printed, e.g. 60 for '1 bar (60 g)'. "
             "Null when only a household measure is printed.",
         ),
-        "serving_size_unit": _nullable(
+        "serving_size_unit": _optional(
             "string", "Unit of serving_size as printed: 'g', 'ml', 'oz'. Null if none."
         ),
-        "household_serving": _nullable(
+        "household_serving": _optional(
             "string", "Household measure as printed: '1 bar', '2 scoops', '1 bottle'."
         ),
-        "servings_per_container": _nullable(
+        "servings_per_container": _optional(
             "number",
             "Servings per container as printed. Null when the panel does not "
             "say -- do not assume 1.",
@@ -276,10 +293,11 @@ NUTRITION_LABEL_SCHEMA = {
             "type": "object",
             "description": "The macro column per serving, as printed. Null for absent rows.",
             "properties": {
-                name: _nullable("number", description)
+                name: _optional("number", description)
                 for name, description in _LABEL_MACROS
             },
-            "required": [name for name, _ in _LABEL_MACROS],
+            # No row is required: an omitted key is a row the panel does not
+            # carry. Requiring them all forced a nullable union per field.
             "additionalProperties": False,
         },
         "micronutrients_per_serving": {
@@ -289,10 +307,13 @@ NUTRITION_LABEL_SCHEMA = {
                 "printed as an amount. Never derive an amount from a %DV."
             ),
             "properties": {
-                name: _nullable("number", f"Amount per serving in {unit}, or null.")
+                name: _optional(
+                    "number",
+                    f"Amount per serving in {unit}. Omit if not printed.",
+                )
                 for name, unit in LABEL_MICRONUTRIENTS
             },
-            "required": [name for name, _ in LABEL_MICRONUTRIENTS],
+            # Sparse by nature -- most panels print a handful of these.
             "additionalProperties": False,
         },
         "confidence": {
@@ -308,15 +329,13 @@ NUTRITION_LABEL_SCHEMA = {
             ),
         },
     },
+    # Only the fields that are always answerable. Everything read off the
+    # panel is optional, because "the panel does not print it" is a real and
+    # common answer -- see _optional for why that is expressed as an absent
+    # key rather than a null.
     "required": [
         "panel_found",
         "unreadable_reason",
-        "product_name",
-        "brand",
-        "serving_size",
-        "serving_size_unit",
-        "household_serving",
-        "servings_per_container",
         "per_serving",
         "micronutrients_per_serving",
         "confidence",
