@@ -529,3 +529,92 @@ class RoutingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _count_union_parameters(node) -> int:
+    """Parameters whose type is a union -- a type array, anyOf or oneOf.
+
+    Mirrors what the API counts when it rejects a schema for carrying too
+    many of them.
+    """
+    total = 0
+    if isinstance(node, dict):
+        if isinstance(node.get("type"), list) or "anyOf" in node or "oneOf" in node:
+            total += 1
+        for key, value in node.items():
+            if key in ("required", "enum", "description"):
+                continue
+            total += _count_union_parameters(value)
+    elif isinstance(node, list):
+        for value in node:
+            total += _count_union_parameters(value)
+    return total
+
+
+class SchemaUnionBudgetTests(unittest.TestCase):
+    """The schema must stay inside the API's union-type budget.
+
+    Every label scan was rejected before it reached the model:
+
+        400 invalid_request_error -- Schemas contains too many parameters with
+        union types (24 parameters with type arrays or anyOf) ... limit: 16
+
+    Six top-level fields plus seven macros plus eleven micronutrients came to
+    exactly 24. It failed for every user on every photo, which is why it never
+    looked like a flaky bug. Adding one more nullable row would put it back, so
+    the budget is asserted rather than remembered.
+    """
+
+    LIMIT = 16
+
+    def test_label_schema_is_within_the_union_budget(self):
+        self.assertLessEqual(
+            _count_union_parameters(claude_vision.NUTRITION_LABEL_SCHEMA),
+            self.LIMIT,
+        )
+
+    def test_meal_schema_is_within_the_union_budget(self):
+        self.assertLessEqual(
+            _count_union_parameters(claude_vision.FOOD_DETECTION_SCHEMA),
+            self.LIMIT,
+        )
+
+    def test_a_row_the_panel_omits_is_not_required(self):
+        # "Unknown" is expressed by leaving the key out, so requiring the
+        # optional rows would force the nullable unions straight back.
+        required = set(claude_vision.NUTRITION_LABEL_SCHEMA["required"])
+        for field in ("product_name", "brand", "serving_size", "serving_size_unit"):
+            self.assertNotIn(field, required)
+        macros = claude_vision.NUTRITION_LABEL_SCHEMA["properties"]["per_serving"]
+        self.assertEqual(macros.get("required", []), [])
+
+    def test_no_property_declares_a_nullable_union(self):
+        self.assertEqual(
+            _count_union_parameters(claude_vision.NUTRITION_LABEL_SCHEMA), 0
+        )
+
+
+class OmittedRowsReadAsUnknownTests(unittest.TestCase):
+    """An absent key must mean exactly what an explicit null used to mean."""
+
+    def test_missing_macro_rows_read_as_None_not_zero(self):
+        reading = {"per_serving": {"calories": 210, "protein": 8}}
+        per_serving = na.label_per_serving(reading)
+        self.assertEqual(per_serving["calories"], 210)
+        self.assertEqual(per_serving["protein"], 8)
+        self.assertIsNone(per_serving["fiber"])
+        self.assertIsNone(per_serving["sugar"])
+
+    def test_a_printed_zero_still_survives_as_zero(self):
+        reading = {"per_serving": {"fiber": 0}}
+        self.assertEqual(na.label_per_serving(reading)["fiber"], 0)
+
+    def test_an_absent_per_serving_object_reads_as_all_unknown(self):
+        per_serving = na.label_per_serving({})
+        self.assertTrue(all(value is None for value in per_serving.values()))
+
+    def test_micronutrients_stay_sparse_when_rows_are_omitted(self):
+        reading = {"micronutrients_per_serving": {"calcium": 200}}
+        micros = na.label_micronutrients_per_serving(reading)
+        self.assertEqual(micros, {"calcium": 200})
+
