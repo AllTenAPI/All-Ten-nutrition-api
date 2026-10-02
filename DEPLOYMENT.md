@@ -10,7 +10,7 @@ are stdlib `http.server`.
 
 Get these before deploying. **Set them as environment variables on the deploy
 platform. Never put them in this repo, a `.env` committed to git, or a
-`render.yaml`/`railway.json` file.**
+`render.yaml` file.**
 
 | Variable | Where to get it |
 |---|---|
@@ -39,17 +39,7 @@ regenerated with `poetry lock` or `poetry install` will refuse to run.
 The old `GOOGLE_APPLICATION_CREDENTIALS_JSON` variable is no longer read by
 anything and can be deleted from the Render environment.
 
-## 3. Railway
-
-`railway.json` is already configured:
-
-- Builder: NIXPACKS (installs from `requirements.txt`)
-- Start command: `python app-railway.py`
-- Health check: `/health`
-
-Add the same two variables under **Variables**, then deploy.
-
-## 4. Verify
+## 3. Verify
 
 Replace `$API` with the deployed base URL.
 
@@ -93,7 +83,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST $API/analyze_food \
   -H 'Content-Type: application/json' -d '{"image": "not-an-image"}'
 ```
 
-## 5. A/B testing models
+## 4. A/B testing models
 
 Change one environment variable and restart. No code change:
 

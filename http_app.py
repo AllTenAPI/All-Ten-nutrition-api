@@ -1,6 +1,6 @@
 """Shared HTTP layer for both deploy entrypoints.
 
-``app-render.py`` (Render) and ``app-railway.py`` (Railway) are thin wrappers
+``app-render.py`` (Render) is a thin wrapper
 around this module, so there is exactly one implementation of both the routing
 and the analysis pipeline. Neither platform runs Flask -- this is
 ``http.server``, matching what was already deployed.

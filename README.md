@@ -65,9 +65,8 @@ Neither makes an Anthropic call. See `API_CONTRACT.md`.
 | `usda_client.py` | USDA FoodData Central lookup, ranking, search, barcode + cache |
 | `openfoodfacts_client.py` | Open Food Facts barcode fallback + cache |
 | `food_lookup.py` | `/search_food` and `/barcode` — no LLM call on any path |
-| `http_app.py` | Shared routes and server, used by both entrypoints |
+| `http_app.py` | Routes and server; `app-render.py` is the only entrypoint |
 | `app-render.py` | Render entrypoint (`poetry run python app-render.py`) |
-| `app-railway.py` | Railway entrypoint (`python app-railway.py`) |
 | `test_nutrition_analyzer.py` | Analyzer pipeline tests (stdlib `unittest`) |
 | `test_nutrition_label.py` | Label mode, and the proof meal mode did not move |
 | `test_usda_ranking.py` | Data-type ranking, search paging, USDA barcode matching |
@@ -90,7 +89,7 @@ ever read into a response, written to a file, or committed to this repo.**
 | `MAX_MEAL_CALORIES` | no | `2500` | Above this, flag for confirmation |
 | `MIN_CONFIDENCE` | no | `0.5` | Below this, flag for confirmation |
 | `MAX_FOOD_PORTION_GRAMS` | no | `1500` | Cap on a single food's portion |
-| `PORT` | no | platform | Supplied by Render/Railway |
+| `PORT` | no | platform | Supplied by Render |
 
 If a required variable is missing the server starts, says so on stdout and at
 `/debug`, and returns a clear `misconfigured` error — it never falls back to a
