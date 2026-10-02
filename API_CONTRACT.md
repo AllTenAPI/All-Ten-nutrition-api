@@ -3,7 +3,7 @@
 `analysis_version: 2.0.0-claude-usda`
 
 This is the contract the Flutter client is built against. Both deploy
-entrypoints (`app-render.py`, `app-railway.py`) serve it from the same
+entrypoint (`app-render.py`) serves it from the same
 implementation.
 
 ## Which endpoint to call
@@ -587,7 +587,7 @@ an entry. Counters are reported by `/debug` as `usda_cache` and
 ```
 
 `vision` and `usda` are `"configured"` / `"not_configured"`. Used as the
-Railway health check path.
+Render health check path.
 
 ## `GET /debug`
 

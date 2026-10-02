@@ -4,7 +4,7 @@
 Started by ``poetry run python app-render.py`` (see render.yaml).
 
 All routing and analysis logic lives in ``http_app`` / ``nutrition_analyzer``
-so this entrypoint and ``app-railway.py`` share one implementation. The
+so this entrypoint is a thin wrapper over one shared implementation. The
 Google Cloud Vision analyzer that used to live in this file is preserved in
 git history at commit 1683dbe; it was replaced because label detection cannot
 estimate portion size, which is what made calorie totals wrong.
