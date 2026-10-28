@@ -26,6 +26,7 @@ from urllib.parse import urlparse
 
 import food_lookup
 import nutrition_analyzer
+import request_auth
 
 # A base64-encoded 5 MB image is ~6.7 MB; leave headroom for the JSON envelope.
 MAX_REQUEST_BYTES = 8 * 1024 * 1024
@@ -33,7 +34,7 @@ MAX_REQUEST_BYTES = 8 * 1024 * 1024
 CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
 }
 
 
@@ -50,6 +51,9 @@ class NutritionRequestHandler(BaseHTTPRequestHandler):
         print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {format % args}")
 
     def _send_json(self, payload: dict, status: int = 200) -> None:
+        # Read back by do_POST to refund a photo scan that never reached the
+        # model.
+        self._last_status = status
         body = json.dumps(payload).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -90,7 +94,12 @@ class NutritionRequestHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
 
         if path == "/health":
-            self._send_json(nutrition_analyzer.health_payload())
+            # Says whether sign-in is enforced, so flipping the Render switch
+            # can be confirmed from a browser.
+            self._send_json(
+                nutrition_analyzer.health_payload()
+                | {"auth_required": request_auth.REQUIRED}
+            )
         elif path == "/debug":
             self._send_json(nutrition_analyzer.debug_payload())
         elif path == "/":
@@ -127,6 +136,19 @@ class NutritionRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Not found", "path": path}, status=404)
             return
 
+        uid = self._caller_uid(path)
+        if uid is None and request_auth.REQUIRED:
+            # The body is never read, so the connection cannot be reused:
+            # its bytes would be parsed as the next request.
+            self.close_connection = True
+            self._send_error(
+                401,
+                "auth",
+                "Your sign-in could not be confirmed. Sign out and back in, "
+                "then try again.",
+            )
+            return
+
         try:
             data = self._read_json_body()
         except ValueError as exc:
@@ -140,7 +162,55 @@ class NutritionRequestHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path != "/analyze_food":
+            handler(data)
+            return
+
+        # Photo analysis is the only route that calls the model, so it is the
+        # only one metered.
+        quota = request_auth.per_account if uid else request_auth.anonymous_pool
+        key = uid or request_auth.ANONYMOUS_KEY
+        if not quota.try_consume(key):
+            self._send_error(
+                429,
+                "rate_limit",
+                f"You've used today's {quota.limit} photo scans. They reset "
+                "tomorrow. You can still search for a food or scan a barcode.",
+            )
+            return
         handler(data)
+        if 400 <= getattr(self, "_last_status", 200) < 500:
+            # Rejected before the model ran (bad image, bad mode): no cost.
+            quota.refund(key)
+
+    def _caller_uid(self, path: str):
+        """The verified Firebase uid of the caller, or None.
+
+        Logs why a request has none, never the token itself, so the logs
+        show when every client is sending tokens and enforcement can go on.
+        """
+        token = request_auth.bearer_token(self.headers.get("Authorization"))
+        if token is None:
+            print(f"auth: no token on {path}")
+            return None
+        try:
+            return request_auth.verify_id_token(token)
+        except request_auth.AuthError as exc:
+            print(f"auth: token rejected on {path}: {exc}")
+            return None
+        except Exception as exc:  # certificate fetch failed, and so on
+            print(f"auth: could not verify on {path}: {type(exc).__name__}")
+            return None
+
+    def _send_error(self, status: int, kind: str, message: str) -> None:
+        self._send_json(
+            {
+                "error": {"kind": kind, "message": message, "retryable": False},
+                "needs_confirmation": True,
+                "confirmation_reason": message,
+            },
+            status=status,
+        )
 
     # -- POST handlers -----------------------------------------------------
 
