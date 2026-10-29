@@ -187,5 +187,10 @@ class DailyQuota:
 
 
 per_account = DailyQuota(PER_ACCOUNT_LIMIT)
+
+# Natural-voice renders per account per UTC day (natural_voice.py). A
+# Stepper has at most ten affirmations and each is cached once rendered, so
+# this only binds on abuse.
+voice_quota = DailyQuota(_env_int("MAX_VOICE_RENDERS_PER_DAY", 60))
 anonymous_pool = DailyQuota(ANONYMOUS_LIMIT)
 ANONYMOUS_KEY = "anonymous"
