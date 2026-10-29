@@ -25,6 +25,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 import food_lookup
+import natural_voice
 import nutrition_analyzer
 import request_auth
 
@@ -98,7 +99,11 @@ class NutritionRequestHandler(BaseHTTPRequestHandler):
             # can be confirmed from a browser.
             self._send_json(
                 nutrition_analyzer.health_payload()
-                | {"auth_required": request_auth.REQUIRED}
+                | {
+                    "auth_required": request_auth.REQUIRED,
+                    # Whether the ELEVENLABS_API_KEY is set; never the key.
+                    "natural_voice": natural_voice.is_configured(),
+                }
             )
         elif path == "/debug":
             self._send_json(nutrition_analyzer.debug_payload())
@@ -117,6 +122,7 @@ class NutritionRequestHandler(BaseHTTPRequestHandler):
                         "/analyze_food",
                         "/search_food",
                         "/barcode",
+                        "/speak",
                     ],
                 }
             )
@@ -132,6 +138,8 @@ class NutritionRequestHandler(BaseHTTPRequestHandler):
             handler = self._handle_search_food
         elif path == "/barcode":
             handler = self._handle_barcode
+        elif path == "/speak":
+            handler = self._handle_speak
         else:
             self._send_json({"error": "Not found", "path": path}, status=404)
             return
@@ -160,6 +168,33 @@ class NutritionRequestHandler(BaseHTTPRequestHandler):
                 },
                 status=400,
             )
+            return
+
+        if path == "/speak":
+            # New route, so no older app build calls it: sign-in is required
+            # now rather than behind REQUIRE_FIREBASE_AUTH. Every render spends
+            # ElevenLabs characters, so each account has its own daily cap.
+            if uid is None:
+                self._send_error(
+                    401,
+                    "auth",
+                    "Your sign-in could not be confirmed. Sign out and back "
+                    "in, then try again.",
+                )
+                return
+            if not request_auth.voice_quota.try_consume(uid):
+                self._send_error(
+                    429,
+                    "rate_limit",
+                    "That is today's limit for new voice readings. Saved "
+                    "ones still play; new ones use the phone's voice until "
+                    "tomorrow.",
+                )
+                return
+            handler(data)
+            if getattr(self, "_last_status", 200) != 200:
+                # Nothing was rendered, so nothing was spent.
+                request_auth.voice_quota.refund(uid)
             return
 
         if path != "/analyze_food":
@@ -268,6 +303,11 @@ class NutritionRequestHandler(BaseHTTPRequestHandler):
     def _handle_search_food(self, data: dict) -> None:
         """Free-text food search. Makes no Anthropic call on any path."""
         payload, status = food_lookup.search_food(data)
+        self._send_json(payload, status=status)
+
+    def _handle_speak(self, data: dict) -> None:
+        """Affirmation text to an MP3 in a natural voice. See natural_voice."""
+        payload, status = natural_voice.speak(data)
         self._send_json(payload, status=status)
 
     def _handle_barcode(self, data: dict) -> None:
