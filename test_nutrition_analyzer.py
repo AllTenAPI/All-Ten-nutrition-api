@@ -727,6 +727,28 @@ class UsdaParsingTests(unittest.TestCase):
         )
 
 
+class KitchenScaleTests(unittest.TestCase):
+    """The meal prompt must tell the model to use a legible scale reading.
+
+    It read scales unprompted some of the time; that is not a feature. These
+    pin the instruction so a prompt edit cannot quietly drop it.
+    """
+
+    def test_meal_prompt_prefers_a_legible_scale_reading(self):
+        prompt = claude_vision.SYSTEM_PROMPT
+        self.assertIn("kitchen scale", prompt)
+        self.assertIn("IS the weight of that food", prompt)
+        self.assertIn("tared", prompt)
+        self.assertIn("1 oz = 28.35 g", prompt)
+        self.assertIn("add up to the reading", prompt)
+        self.assertIn("do not guess them", prompt)
+        self.assertIn("kitchen scale", claude_vision.USER_PROMPT)
+
+    def test_label_mode_is_left_alone(self):
+        # A nutrition panel has no portion to weigh.
+        self.assertNotIn("kitchen scale", claude_vision.LABEL_SYSTEM_PROMPT)
+
+
 class ImagePreparationTests(unittest.TestCase):
     def _b64(self, raw: bytes) -> str:
         return base64.b64encode(raw).decode("ascii")
