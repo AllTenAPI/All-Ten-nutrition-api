@@ -67,6 +67,20 @@ SYSTEM_PROMPT = (
     "side plate about 20 cm, a fork about 19 cm long, a standard mug holds "
     "about 350 ml. Estimate the cooked, as-served weight in grams of each "
     "food, not a nominal 'serving'.\n\n"
+    "A kitchen scale beats any estimate. If the food is sitting on a kitchen "
+    "scale and its display is legible, the number on the display IS the "
+    "weight of that food:\n"
+    "- Assume the container was tared (zeroed) first, because that is how "
+    "people weigh food. Do not subtract a plate or bowl from the reading.\n"
+    "- Convert to grams: 1 oz = 28.35 g, 1 lb = 453.6 g, and read 'lb:oz' "
+    "displays as pounds plus ounces. A reading in ml counts as grams only "
+    "for a water-like drink.\n"
+    "- If one food is on the scale, its portion is the reading. If several "
+    "are, split the reading between them by how much of each you see, so the "
+    "portions add up to the reading exactly.\n"
+    "- Foods that are not on the scale are estimated as usual.\n"
+    "- If the digits are blurred, cut off, glared out or ambiguous, do not "
+    "guess them: estimate from the photo as if there were no scale.\n\n"
     "Rules:\n"
     "- List each distinct food separately. Do not merge a whole plate into "
     "one entry unless it genuinely is one dish.\n"
@@ -87,7 +101,8 @@ SYSTEM_PROMPT = (
 
 USER_PROMPT = (
     "Identify every food in this meal photo and estimate the as-served "
-    "portion weight in grams for each. Return the structured result."
+    "portion weight in grams for each, using the reading on a kitchen scale "
+    "if the food is on one. Return the structured result."
 )
 
 # Schema for output_config.format. Parsed with json.loads -- never string
